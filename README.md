@@ -24,3 +24,8 @@ the `agrocamping-pogoda` runit service.
 To avoid a second copy that drifts from the running one. `.gitignore` ignores
 everything and then names the files above, so the directory's binaries, symlinks
 and credential-touching helpers stay out by construction.
+
+The cost of that safety: **a new bar script has to be added to `.gitignore` as
+well, or it will never be tracked.** `git add` skips an ignored file without a
+word and the commit looks complete, so the miss is silent. Check `git ls-files`
+against the block list in `~/src/dwmblocks/blocks.h` when adding one.
