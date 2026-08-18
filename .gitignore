@@ -1,0 +1,18 @@
+# Whitelist repo: ~/.local/bin holds far more than the status bar — vendored
+# binaries, symlinks into plugin caches, one-off helpers, some of which touch
+# credentials. Ignore everything, then name exactly what belongs here, so no
+# stray `git add` can sweep in something that should never leave this machine.
+*
+!.gitignore
+!README.md
+
+!brightness
+!brightness-down
+!brightness-up
+!cc-usage
+!codex-usage
+!gpu
+!ping-artix
+!pogoda
+!volume
+!weather

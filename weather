@@ -1,0 +1,278 @@
+#!/bin/sh
+# Weather for the dwm bar. Facts come from the same forecast cache `pogoda`
+# reads; the bar shows one at a time, in rotation. A sudden turn in the
+# forecast blinks red until the status is clicked — that runs `weather --ack`.
+# ponytail: every knob lives here, each overridable from the environment.
+HOURS=${WEATHER_HOURS:-4}	# rain horizon, also spelled out on the bar
+DWELL=${WEATHER_DWELL:-30}	# seconds per fact
+REBUILD=${WEATHER_REBUILD:-300}	# seconds between recomputes
+CACHE=${WEATHER_CACHE:-$HOME/.local/state/agrocamping-recepcja/pogoda.json}
+LOG=${WEATHER_LOG:-${CACHE%.json}.jsonl}
+FACTS=${WEATHER_FACTS:-$HOME/.cache/weather-facts}
+NOW=${WEATHER_NOW:-$(date +%s)}
+ALERT=$FACTS.alert
+ACK=$FACTS.ack
+
+# ponytail: alert thresholds are guesses; one place to turn them up
+RAIN_TURN=3	# mm of difference in the 6h precipitation total
+GUST_TURN=20	# km/h a gust has to gain...
+GUST_MIN=50	# ...and it only counts above this
+TEMP_TURN=5	# °C shift on any of the six hours
+
+FACTS_JQ='
+def rnd: (. + 0.5) | floor;
+def epoch: strptime("%Y-%m-%dT%H:%M") | mktime;
+def hhmm: .[11:16];
+def span($m):
+	if   $m < 60   then "\($m) min"
+	elif $m < 1440 then (($m + 30) / 60 | floor) as $v | "\($v) hour\(if $v == 1 then "" else "s" end)"
+	else                (($m + 720) / 1440 | floor) as $v | "\($v) day\(if $v == 1 then "" else "s" end)"
+	end;
+def kind($mm; $t): if $t <= 0 then "snow" elif $mm >= 4 then "heavy rain" else "rain" end;
+# cloudPct only lands once the recepcja fetch asks for it; until then: no adjective
+def sky($c): if $c == null then "" elif $c < 20 then "clear " elif $c < 60 then "partly " else "cloudy " end;
+
+(.fetchedAt // 0) as $fetched
+| (($now * 1000) - $fetched) as $stale
+| if $stale > 1800000
+  then "weather \(($fetched / 1000) | strflocaltime("%H:%M")) ⧗\(($stale / 60000) | floor) min"
+  else (
+    ($now | strflocaltime("%Y-%m-%dT%H:%M")) as $nowstr
+    | ($nowstr | epoch) as $n0
+    | ($nowstr[0:10]) as $today
+    | [ .hourly[] | select(((.targetHour | epoch) - $n0) > -3600) ] as $f
+    | ($f[0].tempC | rnd) as $temp
+    | ([ $f[] | select(.precipMm > 0) ] | first) as $rain
+    | (if $rain == null then null else ((($rain.targetHour | epoch) - $n0) / 60 | floor) end) as $rm
+    | (if   $rain == null or $rm > $h * 60 then "no rain in \(span($h * 60)) \($temp)°C"
+       elif $rm <= 0 then "\(kind($rain.precipMm; ($rain.tempC | rnd))) now \($rain.precipMm) mm \($temp)°C"
+       else "\(kind($rain.precipMm; ($rain.tempC | rnd))) in \(span($rm)) \($rain.precipMm) mm \($temp)°C"
+       end) as $rainfact
+    | [ $f[] | select(((.targetHour | epoch) - $n0) <= 86400) ] as $day1
+    | ([ $day1[] | select((.targetHour[11:13] | tonumber) as $x | $x >= 22 or $x <= 7) ] | min_by(.tempC)) as $low
+    | ([ $day1[] | select((.targetHour[11:13] | tonumber) as $x | $x >= 8 and $x <= 20) ] | max_by(.tempC)) as $high
+    | ($day1 | max_by(.windGustKmh)) as $gust
+    | ([ $f[] | select(((.targetHour | epoch) - $n0) <= $h * 3600) ] | max_by(.precipProb)) as $prob
+    | [ $rainfact,
+        (if $low == null then null
+         else "night \(sky($low.cloudPct))tlow \($low.tempC | rnd)°C at \($low.targetHour | hhmm)" end),
+        (if $high == null then null
+         else "\(if $high.targetHour[0:10] == $today then "today" else "tomorrow" end) tmax \($high.tempC | rnd)°C at \($high.targetHour | hhmm)" end),
+        (if $gust != null and $gust.windGustKmh >= 40
+         then "gusts \($gust.windGustKmh | rnd) km/h at \($gust.targetHour | hhmm)" else null end),
+        (if ($rainfact | startswith("no rain")) and $prob != null and $prob.precipProb >= 50
+         then "rain chance \($prob.precipProb | rnd)% at \($prob.targetHour | hhmm)" else null end) ]
+    | map(select(. != null)) | .[]
+  )
+  end
+'
+
+ALERT_JQ='
+def rnd: (. + 0.5) | floor;
+def one: (. * 10 | rnd) / 10;
+def sign: if . > 0 then "+\(one)" else "\(one)" end;
+def epoch: strptime("%Y-%m-%dT%H:%M") | mktime;
+def hhmm: .[11:16];
+
+($now | strflocaltime("%Y-%m-%dT%H:%M") | epoch) as $n0
+| (map(.fetchedAt) | max) as $new
+| ([ .[] | select(.fetchedAt <= ($new - 1800000)) | .fetchedAt ] | max) as $old
+| [ .[] | select(((.targetHour | epoch) - $n0) as $d | $d > -3600 and $d <= 21600) ] as $w
+| [ $w[] | select(.fetchedAt == $new) ] as $A
+| [ $w[] | select(.fetchedAt == $old) ] as $B
+| if $old == null or ($A | length) == 0 or ($B | length) == 0 then empty else
+    (($A | map(.precipMm) | add) - ($B | map(.precipMm) | add)) as $dr
+  | ($A | max_by(.windGustKmh)) as $ga
+  | ($ga.windGustKmh - ($B | map(.windGustKmh) | max)) as $dg
+  | ([ $A[] as $a | $B[] | select(.targetHour == $a.targetHour) | { h: $a.targetHour, d: ($a.tempC - .tempC) } ]
+     | max_by(.d | fabs)) as $dt
+  | if   ($dr | fabs) >= $rain
+    then "rain\train turn \($dr | sign) mm by \($A[-1].targetHour | hhmm)"
+    elif $dg >= $gust and $ga.windGustKmh >= $gustmin
+    then "gust\tgust turn \($ga.windGustKmh | rnd) km/h at \($ga.targetHour | hhmm)"
+    elif $dt != null and ($dt.d | fabs) >= $temp
+    then "temp\ttemp turn \($dt.d | sign)°C at \($dt.h | hhmm)"
+    else empty end
+  end
+'
+
+# first line of the facts file is the build time, so a tick needs no stat(1)
+rebuild() {
+	mkdir -p "${FACTS%/*}"
+	{
+		echo "$NOW"
+		[ -f "$CACHE" ] && jq -r --argjson now "$NOW" --argjson h "$HOURS" "$FACTS_JQ" "$CACHE" 2>/dev/null
+	} > "$FACTS.tmp"
+	[ "$(wc -l < "$FACTS.tmp")" -gt 1 ] || echo 'weather: no data' >> "$FACTS.tmp"
+	mv "$FACTS.tmp" "$FACTS"
+
+	# 600 linii to ~12 zrzutow po 48 godzin, czyli ~3 h historii; gdyby logger wydluzyl
+	# horyzont prognozy, ten ogon trzeba podniesc, inaczej $old wyjdzie null i alert zniknie
+	#
+	# jq, ktory padl na urwanej linii logu (tail w trakcie zapisu), to nie to samo co
+	# policzone i puste: pusty log konczy sie kodem 0, urwana linia kodem 5. Tylko wynik
+	# policzony rusza pliki, inaczej zaackowane zjawisko zamigaloby od nowa po awarii.
+	if [ -f "$LOG" ] && tail -n 600 "$LOG" | jq -s -r --argjson now "$NOW" \
+		--argjson rain "$RAIN_TURN" --argjson gust "$GUST_TURN" \
+		--argjson gustmin "$GUST_MIN" --argjson temp "$TEMP_TURN" \
+		"$ALERT_JQ" > "$ALERT.tmp" 2>/dev/null
+	then
+		mv "$ALERT.tmp" "$ALERT"
+		# bez tego jeden ack uciszalby ten rodzaj alertu na zawsze
+		[ -s "$ALERT" ] || : > "$ACK"
+	else
+		rm -f "$ALERT.tmp"
+	fi
+}
+
+fresh() {
+	built=0
+	[ -s "$FACTS" ] && read -r built < "$FACTS"
+	[ "$CACHE" -nt "$FACTS" ] || [ $(( NOW - built )) -ge "$REBUILD" ] && rebuild
+	:
+}
+
+case ${1:-} in
+--ack)
+	[ -s "$ALERT" ] && { IFS='	' read -r id _ < "$ALERT"; printf '%s\n' "$id" > "$ACK"; }
+	pkill -RTMIN+12 dwmblocks 2>/dev/null
+	exit 0
+	;;
+--facts)
+	fresh
+	sed 1d "$FACTS"
+	exit 0
+	;;
+--test)
+	T0=$(date -d 'today 12:00' +%s)	# fixed hour of day, so fixture offsets and labels are stable
+	t_dir=$(mktemp -d)
+	t_fail=0
+	trap 'rm -rf "$t_dir"' EXIT
+
+	mkcache() {	# $1 rain hour offset (-1 none), $2 mm, $3 rain temp, $4 base temp, $5 gust, $6 prob, $7 cache age min
+		i=0
+		printf '{"fetchedAt":%d,"hourly":[' "$(( (T0 - ${7:-0} * 60) * 1000 ))"
+		while [ $i -lt 24 ]; do
+			[ $i -gt 0 ] && printf ','
+			if [ "$i" = "$1" ]; then mm=$2; tp=$3; else mm=0; tp=$4; fi
+			printf '{"targetHour":"%s","precipMm":%s,"precipProb":%s,"tempC":%s,"windGustKmh":%s}' \
+				"$(date -d "@$(( T0 + i * 3600 ))" +%Y-%m-%dT%H:00)" "$mm" "$6" "$tp" "$5"
+			i=$(( i + 1 ))
+		done
+		printf ']}\n'
+	}
+
+	mklog() {	# $1 mm in the older snapshot, $2 mm in the newest one
+		i=1
+		while [ $i -le 6 ]; do
+			th=$(date -d "@$(( T0 + i * 3600 ))" +%Y-%m-%dT%H:00)
+			printf '{"fetchedAt":%d,"targetHour":"%s","precipMm":%s,"precipProb":50,"tempC":18,"windGustKmh":10}\n' "$(( (T0 - 3600) * 1000 ))" "$th" "$1"
+			printf '{"fetchedAt":%d,"targetHour":"%s","precipMm":%s,"precipProb":50,"tempC":18,"windGustKmh":10}\n' "$(( T0 * 1000 ))" "$th" "$2"
+			i=$(( i + 1 ))
+		done
+	}
+
+	run() {	# $1 optional mode; T_NOW, T_DWELL, T_HOURS tune the call
+		WEATHER_CACHE=$t_dir/cache.json WEATHER_LOG=$t_dir/log.jsonl \
+		WEATHER_FACTS=$t_dir/facts WEATHER_NOW=${T_NOW:-$T0} \
+		WEATHER_DWELL=${T_DWELL:-30} WEATHER_HOURS=${T_HOURS:-4} WEATHER_REBUILD=0 \
+		"$0" ${1:+"$1"} | tr -d '\001\003\005' > "$t_dir/out"
+	}
+
+	has() {	# $1 label, $2 how the wanted line starts
+		while IFS= read -r line; do
+			case $line in "$2"*) printf 'OK   %s\n' "$1"; return 0 ;; esac
+		done < "$t_dir/out"
+		t_fail=1
+		printf 'FAIL %s — no "%s", got:\n%s\n' "$1" "$2" "$(cat "$t_dir/out")"
+	}
+
+	: > "$t_dir/log.jsonl"
+	mkcache -1 0 0 15 10 10   > "$t_dir/cache.json"; run --facts
+	has 'brak deszczu'      'no rain in 4 hours 15°C'
+	has 'noc'               'night tlow '
+	has 'dzien'             'tomorrow tmax '
+	mkcache 2 1.2 16 15 10 10 > "$t_dir/cache.json"; run --facts
+	has 'deszcz w horyzoncie' 'rain in 2 hours 1.2 mm 15°C'
+	mkcache 0 1.2 15 15 10 10 > "$t_dir/cache.json"; run --facts
+	has 'deszcz teraz'      'rain now 1.2 mm 15°C'
+	mkcache 2 1.2 -3 -1 10 10 > "$t_dir/cache.json"; run --facts
+	has 'snieg'             'snow in 2 hours 1.2 mm -1°C'
+	mkcache 2 5 16 15 10 10   > "$t_dir/cache.json"; run --facts
+	has 'ulewa'             'heavy rain in 2 hours 5 mm 15°C'
+	mkcache -1 0 0 15 55 10   > "$t_dir/cache.json"; run --facts
+	has 'porywy'            'gusts 55 km/h at '
+	mkcache -1 0 0 15 10 80   > "$t_dir/cache.json"; run --facts
+	has 'szansa opadu'      'rain chance 80% at '
+	mkcache 12 1.2 16 15 10 10 > "$t_dir/cache.json"; T_HOURS=1 run --facts
+	has 'deszcz za horyzontem' 'no rain in 1 hour 15°C'
+	mkcache -1 0 0 15 10 10 40 > "$t_dir/cache.json"; run --facts
+	has 'cache przeterminowany' 'weather '
+	rm -f "$t_dir/cache.json"; run --facts
+	has 'brak cache'        'weather: no data'
+
+	# rotacja: kolejne kroki DWELL muszą dać różne fakty
+	mkcache -1 0 0 15 10 10 > "$t_dir/cache.json"
+	T_DWELL=1 T_NOW=$T0       run; seen=$(cat "$t_dir/out")
+	T_DWELL=1 T_NOW=$((T0+1)) run; seen="$seen
+$(cat "$t_dir/out")"
+	T_DWELL=1 T_NOW=$((T0+2)) run; seen="$seen
+$(cat "$t_dir/out")"
+	if [ "$(printf '%s\n' "$seen" | sort -u | wc -l)" -eq 3 ]
+	then printf 'OK   rotacja\n'
+	else t_fail=1; printf 'FAIL rotacja — %s\n' "$(printf '%s ' $seen)"; fi
+
+	# alert: skok opadu, miganie, kasowanie
+	mklog 0 0.8 > "$t_dir/log.jsonl"
+	rm -f "$t_dir/facts"	# rotation ran the clock forward; force a rebuild
+	run; has 'alert opadu' 'rain turn +4.8 mm by '
+	WEATHER_CACHE=$t_dir/cache.json WEATHER_LOG=$t_dir/log.jsonl WEATHER_FACTS=$t_dir/facts \
+		WEATHER_NOW=$T0 WEATHER_REBUILD=0 "$0" > "$t_dir/raw"
+	case $(cat "$t_dir/raw") in
+	*"$(printf '\003')"*) printf 'OK   alert na czerwono\n' ;;
+	*) t_fail=1; printf 'FAIL alert bez koloru\n' ;;
+	esac
+	T_NOW=$((T0+1)) run
+	case $(WEATHER_CACHE=$t_dir/cache.json WEATHER_LOG=$t_dir/log.jsonl WEATHER_FACTS=$t_dir/facts \
+		WEATHER_NOW=$((T0+1)) WEATHER_REBUILD=0 "$0") in
+	*"$(printf '\003')"*) t_fail=1; printf 'FAIL alert nie miga\n' ;;
+	*) printf 'OK   alert miga\n' ;;
+	esac
+	WEATHER_FACTS=$t_dir/facts "$0" --ack
+	rm -f "$t_dir/facts"
+	run; has 'alert skasowany' 'no rain in 4 hours '
+
+	# alert znika -> ack tez, inaczej ten rodzaj milczalby juz zawsze
+	: > "$t_dir/log.jsonl"; rm -f "$t_dir/facts"; run
+	if [ -s "$t_dir/facts.ack" ]
+	then t_fail=1; printf 'FAIL ack przezyl alert\n'
+	else printf 'OK   ack znika z alertem\n'; fi
+	mklog 0 0.8 > "$t_dir/log.jsonl"; rm -f "$t_dir/facts"
+	run; has 'alert wraca po nawrocie' 'rain turn +4.8 mm by '
+
+	# urwana linia w logu (tail zlapal zapis loggera w polowie) nie moze ruszyc acku
+	WEATHER_FACTS=$t_dir/facts "$0" --ack
+	printf '{"fetchedAt":1787,"targ' >> "$t_dir/log.jsonl"
+	rm -f "$t_dir/facts"; run
+	if [ -s "$t_dir/facts.ack" ]
+	then printf 'OK   urwany log nie kasuje acku\n'
+	else t_fail=1; printf 'FAIL urwany log skasowal ack\n'; fi
+
+	exit $t_fail
+	;;
+esac
+
+fresh
+
+if [ -s "$ALERT" ]; then
+	IFS='	' read -r id txt < "$ALERT"
+	ack=''
+	[ -f "$ACK" ] && read -r ack < "$ACK"
+	if [ "$id" != "$ack" ]; then
+		# same width in both phases, so the bar does not jump while it blinks
+		if [ $(( NOW % 2 )) -eq 0 ]; then printf '\003%s\001\n' "$txt"; else printf '%s\n' "$txt"; fi
+		exit 0
+	fi
+fi
+
+awk -v t="$NOW" -v d="$DWELL" 'NR > 1 { a[++n] = $0 } END { if (n) print a[int(t / d) % n + 1] }' "$FACTS"

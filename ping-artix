@@ -1,0 +1,28 @@
+#!/bin/sh
+# Ping on the bar without stalling it. dwmblocks runs its blocks one after
+# another in a single thread, so a 9-second `ping -c10` froze the whole status
+# every 12 seconds — clock included. The block now reads a cached line and the
+# measurement runs off to the side.
+# ponytail: same shape as `weather` — cheap tick, expensive work out of band.
+f=${PING_CACHE:-$HOME/.cache/ping-artix}
+host=${PING_HOST:-artixlinux.org}
+every=${PING_EVERY:-12}
+
+if [ -s "$f" ]; then cat "$f"; else printf ' ---\n'; fi
+
+now=$(date +%s)
+last=0
+[ -s "$f.at" ] && read -r last < "$f.at"
+if [ $(( now - ${last:-0} )) -ge "$every" ]; then
+	mkdir -p "${f%/*}"
+	printf '%s\n' "$now" > "$f.at"
+	(
+		ping -c10 -W2 "$host" 2>/dev/null | awk -F'/' '/rtt/{
+			ms = int($5)
+			if (ms > 999) ms = 999
+			if (ms > 99) printf " %c%dms%c\n", 3, ms, 1; else printf " %dms\n", ms
+		}' > "$f.tmp.$$"
+		[ -s "$f.tmp.$$" ] || printf ' ---\n' > "$f.tmp.$$"
+		mv "$f.tmp.$$" "$f"
+	) >/dev/null 2>&1 &
+fi

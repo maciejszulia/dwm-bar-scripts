@@ -1,0 +1,22 @@
+#!/bin/sh
+# Codex rate-limit window on the dwm bar: how much %% is LEFT + reset clock.
+# Source: Codex rollout logs, which record the rate_limits payload the API returns.
+# A freshly started session has no such entry yet, so walk back through recent
+# rollouts until one carries it, instead of reporting n/a on the newest empty file.
+line=""
+for f in $(find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
+	| sort -rn | head -20 | cut -d' ' -f2-); do
+	line=$(grep '"rate_limits"' "$f" 2>/dev/null | tail -1)
+	[ -n "$line" ] && break
+done
+[ -n "$line" ] || { printf 'n/a\n'; exit 0; }
+
+read -r used resets <<EOT
+$(printf '%s' "$line" | jq -r '[(.payload.rate_limits.primary.used_percent // -1 | round),
+                                (.payload.rate_limits.primary.resets_at // "")] | @tsv' 2>/dev/null)
+EOT
+[ "${used:--1}" -ge 0 ] 2>/dev/null || { printf 'n/a\n'; exit 0; }
+
+mark=""
+[ -n "$resets" ] && [ "$(date +%s)" -ge "$resets" ] && mark="?"
+printf '%d%%%s @ %s\n' "$((100 - used))" "$mark" "$(date -d "@$resets" '+%d.%m %H:%M' 2>/dev/null)"

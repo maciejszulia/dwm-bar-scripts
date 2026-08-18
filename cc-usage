@@ -1,0 +1,35 @@
+#!/bin/sh
+# Claude rate-limit windows on the dwm bar, shaped like codex-usage: how much %%
+# is LEFT + reset clock. The 5h window leads because it is the one that bites,
+# and its colour follows the number:
+# normal above 30% left, caution below it, warning below 10%.
+# Data comes from ~/.claude/rate_limits.json, cached by the statusline script on
+# every render — only a live Claude session receives it from the CLI, so between
+# sessions the values are the last known ones (marked '?' once past their reset).
+f="$HOME/.claude/rate_limits.json"
+[ -f "$f" ] || { printf '%s\n' '--'; exit 0; }
+
+# used_percentage can come back as a float (e.g. 14.0000002) — round to int in
+# jq so POSIX $(()) arithmetic below does not choke on the decimal point.
+read -r u5 r5 u7 r7 <<EOT
+$(jq -r '[(.five_hour.used_percentage // -1 | round), (.five_hour.resets_at // ""),
+          (.seven_day.used_percentage // -1 | round), (.seven_day.resets_at // "")] | @tsv' "$f" 2>/dev/null)
+EOT
+[ "${u5:--1}" -ge 0 ] 2>/dev/null || { printf '%s\n' '--'; exit 0; }
+
+l5=$((100 - u5)); l7=$((100 - u7))
+now=$(date +%s)
+mark5=""; [ -n "$r5" ] && [ "$now" -ge "$r5" ] && mark5="?"
+mark7=""; [ -n "$r7" ] && [ "$now" -ge "$r7" ] && mark7="?"
+
+if   [ "$l5" -lt 10 ]; then esc=$(printf '\003')
+elif [ "$l5" -lt 30 ]; then esc=$(printf '\005')
+else                       esc=$(printf '\001')
+fi
+rst=$(printf '\001')
+
+# the weekly window is context, not a call to action: shorter, but in the same
+# colour as every other value on the bar — only labels are dimmed there
+printf '%s5h %d%%%s%s @ %s  7d %d%%%s @ %s\n' \
+	"$esc" "$l5" "$mark5" "$rst" "$(date -d "@$r5" +%H:%M 2>/dev/null)" \
+	"$l7" "$mark7" "$(date -d "@$r7" '+%d.%m' 2>/dev/null)"
