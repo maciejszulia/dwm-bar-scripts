@@ -12,6 +12,7 @@ FACTS=${WEATHER_FACTS:-$HOME/.cache/weather-facts}
 NOW=${WEATHER_NOW:-$(date +%s)}
 ALERT=$FACTS.alert
 ACK=$FACTS.ack
+SPIN=$FACTS.spin	# "<scroll time> <fact offset>", written by --turn
 
 # ponytail: alert thresholds are guesses; one place to turn them up
 RAIN_TURN=3	# mm of difference in the 6h precipitation total
@@ -138,6 +139,13 @@ case ${1:-} in
 	pkill -RTMIN+12 dwmblocks 2>/dev/null
 	exit 0
 	;;
+--turn)	# scroll on the bar: freeze the fact on show, step by $2, restart the dwell clock
+	t0=0 off=0
+	[ -s "$SPIN" ] && read -r t0 off < "$SPIN"
+	printf '%s %s\n' "$NOW" "$(( off + (NOW - t0) / DWELL + $2 ))" > "$SPIN"
+	pkill -RTMIN+12 dwmblocks 2>/dev/null
+	exit 0
+	;;
 --facts)
 	fresh
 	sed 1d "$FACTS"
@@ -258,6 +266,20 @@ $(cat "$t_dir/out")"
 	then printf 'OK   urwany log nie kasuje acku\n'
 	else t_fail=1; printf 'FAIL urwany log skasowal ack\n'; fi
 
+	# scroll: --turn przesuwa fakt o jeden i wraca na swoje miejsce
+	: > "$t_dir/log.jsonl"; rm -f "$t_dir/facts" "$t_dir/facts.spin" "$t_dir/facts.ack"
+	mkcache -1 0 0 15 10 10 > "$t_dir/cache.json"
+	turn() {	# $1 krokow do przodu
+		WEATHER_CACHE=$t_dir/cache.json WEATHER_LOG=$t_dir/log.jsonl \
+		WEATHER_FACTS=$t_dir/facts WEATHER_NOW=$T0 WEATHER_REBUILD=0 "$0" --turn "$1"
+	}
+	T_NOW=$T0 run; s0=$(cat "$t_dir/out")
+	turn 1;  T_NOW=$T0 run; s1=$(cat "$t_dir/out")
+	turn -1; T_NOW=$T0 run; s2=$(cat "$t_dir/out")
+	if [ "$s0" != "$s1" ] && [ "$s0" = "$s2" ]
+	then printf 'OK   scroll przelacza fakt\n'
+	else t_fail=1; printf 'FAIL scroll — "%s" -> "%s" -> "%s"\n' "$s0" "$s1" "$s2"; fi
+
 	exit $t_fail
 	;;
 esac
@@ -275,4 +297,7 @@ if [ -s "$ALERT" ]; then
 	fi
 fi
 
-awk -v t="$NOW" -v d="$DWELL" 'NR > 1 { a[++n] = $0 } END { if (n) print a[int(t / d) % n + 1] }' "$FACTS"
+spin_t0=0 spin_off=0
+[ -s "$SPIN" ] && read -r spin_t0 spin_off < "$SPIN"
+awk -v t="$(( spin_off + (NOW - spin_t0) / DWELL ))" \
+	'NR > 1 { a[++n] = $0 } END { if (n) print a[(t % n + n) % n + 1] }' "$FACTS"
