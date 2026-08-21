@@ -60,7 +60,7 @@ def sky($c): if $c == null then "" elif $c < 20 then "clear " elif $c < 60 then 
         (if $high == null then null
          else "\(if $high.targetHour[0:10] == $today then "today" else "tomorrow" end) tmax \($high.tempC | rnd)°C at \($high.targetHour | hhmm)" end),
         (if $gust != null and $gust.windGustKmh >= 40
-         then "gusts \($gust.windGustKmh | rnd) km/h at \($gust.targetHour | hhmm)" else null end),
+         then "gusts \($gust.windGustKmh | rnd) km/h \(if $gust.targetHour[0:10] == $today then "at" else "tomorrow" end) \($gust.targetHour | hhmm)" else null end),
         (if ($rainfact | startswith("no rain")) and $prob != null and $prob.precipProb >= 50
          then "rain chance \($prob.precipProb | rnd)% at \($prob.targetHour | hhmm)" else null end) ]
     | map(select(. != null)) | .[]
@@ -157,14 +157,15 @@ case ${1:-} in
 	t_fail=0
 	trap 'rm -rf "$t_dir"' EXIT
 
-	mkcache() {	# $1 rain hour offset (-1 none), $2 mm, $3 rain temp, $4 base temp, $5 gust, $6 prob, $7 cache age min
+	mkcache() {	# $1 rain hour offset (-1 none), $2 mm, $3 rain temp, $4 base temp, $5 gust, $6 prob, $7 cache age min, $8 gust hour (default: every hour)
 		i=0
 		printf '{"fetchedAt":%d,"hourly":[' "$(( (T0 - ${7:-0} * 60) * 1000 ))"
 		while [ $i -lt 24 ]; do
 			[ $i -gt 0 ] && printf ','
 			if [ "$i" = "$1" ]; then mm=$2; tp=$3; else mm=0; tp=$4; fi
+			if [ -z "${8:-}" ] || [ "$i" = "$8" ]; then gs=$5; else gs=10; fi
 			printf '{"targetHour":"%s","precipMm":%s,"precipProb":%s,"tempC":%s,"windGustKmh":%s}' \
-				"$(date -d "@$(( T0 + i * 3600 ))" +%Y-%m-%dT%H:00)" "$mm" "$6" "$tp" "$5"
+				"$(date -d "@$(( T0 + i * 3600 ))" +%Y-%m-%dT%H:00)" "$mm" "$6" "$tp" "$gs"
 			i=$(( i + 1 ))
 		done
 		printf ']}\n'
@@ -208,8 +209,11 @@ case ${1:-} in
 	has 'snieg'             'snow in 2 hours 1.2 mm -1°C'
 	mkcache 2 5 16 15 10 10   > "$t_dir/cache.json"; run --facts
 	has 'ulewa'             'heavy rain in 2 hours 5 mm 15°C'
-	mkcache -1 0 0 15 55 10   > "$t_dir/cache.json"; run --facts
-	has 'porywy'            'gusts 55 km/h at '
+	mkcache -1 0 0 15 55 10 0 2 > "$t_dir/cache.json"; run --facts
+	has 'porywy'            'gusts 55 km/h at 14:00'
+	# T0 to poludnie, wiec godzina 20 fixture'u wypada nazajutrz
+	mkcache -1 0 0 15 70 10 0 20 > "$t_dir/cache.json"; run --facts
+	has 'porywy nazajutrz'  'gusts 70 km/h tomorrow 08:00'
 	mkcache -1 0 0 15 10 80   > "$t_dir/cache.json"; run --facts
 	has 'szansa opadu'      'rain chance 80% at '
 	mkcache 12 1.2 16 15 10 10 > "$t_dir/cache.json"; T_HOURS=1 run --facts
