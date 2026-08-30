@@ -6,6 +6,8 @@
 HOURS=${WEATHER_HOURS:-4}	# rain horizon, also spelled out on the bar
 DWELL=${WEATHER_DWELL:-30}	# seconds per fact
 REBUILD=${WEATHER_REBUILD:-300}	# seconds between recomputes
+LAT=${WEATHER_LAT:-53.7784}	# Olsztyn; the sun times are computed here, the cache has none
+LON=${WEATHER_LON:-20.4801}
 CACHE=${WEATHER_CACHE:-$HOME/.local/state/agrocamping-recepcja/pogoda.json}
 LOG=${WEATHER_LOG:-${CACHE%.json}.jsonl}
 FACTS=${WEATHER_FACTS:-$HOME/.cache/weather-facts}
@@ -26,9 +28,35 @@ def epoch: strptime("%Y-%m-%dT%H:%M") | mktime;
 def hhmm: .[11:16];
 def span($m):
 	if   $m < 60   then "\($m) min"
-	elif $m < 1440 then (($m + 30) / 60 | floor) as $v | "\($v) hour\(if $v == 1 then "" else "s" end)"
+	elif $m < 1440 then "\(($m + 30) / 60 | floor)h"
 	else                (($m + 720) / 1440 | floor) as $v | "\($v) day\(if $v == 1 then "" else "s" end)"
 	end;
+def pi: 4 * (1 | atan);
+def rad: . * pi / 180;
+def deg: . * 180 / pi;
+def wrap($m): . - ($m * (. / $m | floor));
+# ponytail: the 1990 almanac formula, right to about a minute. The forecast cache carries
+# no sun times and a block must not reach the network, so the bar works them out itself.
+def suntime($lat; $lon; $rise; $mid):
+	(($mid | gmtime | .[7]) + 1) as $N
+	| ($lon / 15) as $lh
+	| ($N + ((if $rise then 6 else 18 end) - $lh) / 24) as $t
+	| (0.9856 * $t - 3.289) as $M
+	| (($M + 1.916 * ($M | rad | sin) + 0.020 * ((2 * $M) | rad | sin) + 282.634) | wrap(360)) as $L
+	| ((atan2(0.91764 * ($L | rad | sin); ($L | rad | cos)) | deg | wrap(360)) / 15) as $RA
+	| (0.39782 * ($L | rad | sin)) as $sinDec
+	| ($sinDec | asin | cos) as $cosDec
+	| (((90.833 | rad | cos) - $sinDec * ($lat | rad | sin)) / ($cosDec * ($lat | rad | cos))) as $cosH
+	| if $cosH > 1 or $cosH < -1 then null	# polar day or night: the event never comes
+	  else ((if $rise then 360 - ($cosH | acos | deg) else ($cosH | acos | deg) end) / 15) as $H
+	  | (($H + $RA - 0.06571 * $t - 6.622 - $lh) | wrap(24)) as $UT
+	  | ($mid + $UT * 3600)
+	  end;
+# the event for today may already be behind us, so the one for tomorrow is the fallback
+def nextsun($lat; $lon; $rise; $t):
+	(($t / 86400 | floor) * 86400) as $mid
+	| [ suntime($lat; $lon; $rise; $mid), suntime($lat; $lon; $rise; $mid + 86400) ]
+	| map(select(. != null and . > $t)) | first;
 def kind($mm; $t): if $t <= 0 then "snow" elif $mm >= 4 then "heavy rain" else "rain" end;
 # cloudPct only lands once the recepcja fetch asks for it; until then: no adjective
 def sky($c): if $c == null then "" elif $c < 20 then "clear " elif $c < 60 then "partly " else "cloudy " end;
@@ -54,11 +82,17 @@ def sky($c): if $c == null then "" elif $c < 20 then "clear " elif $c < 60 then 
     | ([ $day1[] | select((.targetHour[11:13] | tonumber) as $x | $x >= 8 and $x <= 20) ] | max_by(.tempC)) as $high
     | ($day1 | max_by(.windGustKmh)) as $gust
     | ([ $f[] | select(((.targetHour | epoch) - $n0) <= $h * 3600) ] | max_by(.precipProb)) as $prob
+    | nextsun($lat; $lon; true; $now) as $sunrise
+    | nextsun($lat; $lon; false; $now) as $sunset
     | [ $rainfact,
         (if $low == null then null
          else "night \(sky($low.cloudPct))tlow \($low.tempC | rnd)°C at \($low.targetHour | hhmm)" end),
         (if $high == null then null
          else "\(if $high.targetHour[0:10] == $today then "today" else "tomorrow" end) tmax \($high.tempC | rnd)°C at \($high.targetHour | hhmm)" end),
+        (if $sunrise == null then null
+         else "sunrise in \(span(($sunrise - $now) / 60 | floor)) at \($sunrise | strflocaltime("%H:%M"))" end),
+        (if $sunset == null then null
+         else "sunset in \(span(($sunset - $now) / 60 | floor)) at \($sunset | strflocaltime("%H:%M"))" end),
         (if $gust != null and $gust.windGustKmh >= 40
          then "gusts \($gust.windGustKmh | rnd) km/h \(if $gust.targetHour[0:10] == $today then "at" else "tomorrow" end) \($gust.targetHour | hhmm)" else null end),
         (if ($rainfact | startswith("no rain")) and $prob != null and $prob.precipProb >= 50
@@ -102,7 +136,8 @@ rebuild() {
 	mkdir -p "${FACTS%/*}"
 	{
 		echo "$NOW"
-		[ -f "$CACHE" ] && jq -r --argjson now "$NOW" --argjson h "$HOURS" "$FACTS_JQ" "$CACHE" 2>/dev/null
+		[ -f "$CACHE" ] && jq -r --argjson now "$NOW" --argjson h "$HOURS" \
+			--argjson lat "$LAT" --argjson lon "$LON" "$FACTS_JQ" "$CACHE" 2>/dev/null
 	} > "$FACTS.tmp"
 	[ "$(wc -l < "$FACTS.tmp")" -gt 1 ] || echo 'weather: no data' >> "$FACTS.tmp"
 	mv "$FACTS.tmp" "$FACTS"
@@ -198,17 +233,28 @@ case ${1:-} in
 
 	: > "$t_dir/log.jsonl"
 	mkcache -1 0 0 15 10 10   > "$t_dir/cache.json"; run --facts
-	has 'brak deszczu'      'no rain in 4 hours 15°C'
+	has 'brak deszczu'      'no rain in 4h 15°C'
 	has 'noc'               'night tlow '
 	has 'dzien'             'tomorrow tmax '
+	has 'wschod'            'sunrise in '
+	has 'zachod'            'sunset in '
+	# Sun times are computed, not fetched, so one day is nailed down: 21.06.2026 in Olsztyn.
+	# Checked against Open-Meteo (04:07 / 21:12) and the NOAA spreadsheet (04:07 / 21:13);
+	# the almanac formula runs about a minute early. Reads the machine clock zone, as the bar does.
+	sol=$(date -d '2026-06-21 12:00' +%s)
+	printf '{"fetchedAt":%d,"hourly":[{"targetHour":"2026-06-21T12:00","precipMm":0,"precipProb":0,"tempC":20,"windGustKmh":10,"cloudPct":50}]}\n' \
+		"$(( sol * 1000 ))" > "$t_dir/cache.json"
+	rm -f "$t_dir/facts"; T_NOW=$sol run --facts; T_NOW=''
+	has 'wschod w przesilenie' 'sunrise in 16h at 04:06'
+	has 'zachod w przesilenie' 'sunset in 9h at 21:12'
 	mkcache 2 1.2 16 15 10 10 > "$t_dir/cache.json"; run --facts
-	has 'deszcz w horyzoncie' 'rain in 2 hours 1.2 mm 15°C'
+	has 'deszcz w horyzoncie' 'rain in 2h 1.2 mm 15°C'
 	mkcache 0 1.2 15 15 10 10 > "$t_dir/cache.json"; run --facts
 	has 'deszcz teraz'      'rain now 1.2 mm 15°C'
 	mkcache 2 1.2 -3 -1 10 10 > "$t_dir/cache.json"; run --facts
-	has 'snieg'             'snow in 2 hours 1.2 mm -1°C'
+	has 'snieg'             'snow in 2h 1.2 mm -1°C'
 	mkcache 2 5 16 15 10 10   > "$t_dir/cache.json"; run --facts
-	has 'ulewa'             'heavy rain in 2 hours 5 mm 15°C'
+	has 'ulewa'             'heavy rain in 2h 5 mm 15°C'
 	mkcache -1 0 0 15 55 10 0 2 > "$t_dir/cache.json"; run --facts
 	has 'porywy'            'gusts 55 km/h at 14:00'
 	# T0 to poludnie, wiec godzina 20 fixture'u wypada nazajutrz
@@ -217,7 +263,7 @@ case ${1:-} in
 	mkcache -1 0 0 15 10 80   > "$t_dir/cache.json"; run --facts
 	has 'szansa opadu'      'rain chance 80% at '
 	mkcache 12 1.2 16 15 10 10 > "$t_dir/cache.json"; T_HOURS=1 run --facts
-	has 'deszcz za horyzontem' 'no rain in 1 hour 15°C'
+	has 'deszcz za horyzontem' 'no rain in 1h 15°C'
 	mkcache -1 0 0 15 10 10 40 > "$t_dir/cache.json"; run --facts
 	has 'cache przeterminowany' 'weather '
 	rm -f "$t_dir/cache.json"; run --facts
@@ -252,7 +298,7 @@ $(cat "$t_dir/out")"
 	esac
 	WEATHER_FACTS=$t_dir/facts "$0" --ack
 	rm -f "$t_dir/facts"
-	run; has 'alert skasowany' 'no rain in 4 hours '
+	run; has 'alert skasowany' 'no rain in 4h '
 
 	# alert znika -> ack tez, inaczej ten rodzaj milczalby juz zawsze
 	: > "$t_dir/log.jsonl"; rm -f "$t_dir/facts"; run
