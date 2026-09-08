@@ -5,4 +5,4 @@ case $BUTTON in
 esac
 MAX=$(cat /sys/class/backlight/*/max_brightness)
 CUR=$(cat /sys/class/backlight/*/brightness)
-echo "$((CUR * 100 / MAX))%"
+printf '%4s\n' "$((CUR * 100 / MAX))%"	# stała szerokość, jak VOL
