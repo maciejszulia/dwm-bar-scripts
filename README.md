@@ -11,7 +11,7 @@ The block chain behind the dwm status bar on the T470p. Blocks are wired in
 | `cc-usage` | `CLD` | Claude rate-limit windows from `~/.claude/rate_limits.json`. |
 | `codex-usage` | `CDX` | Codex rate limit, dug out of the newest rollout log that carries one. |
 | `gpu` | `GPU` | Temperature and utilisation via `nvidia-smi`. |
-| `cpu` | `CPU` | Package temperature, load since the last tick, mean core clock and fan `level:rpm`; wheel/left click step the fan floor up, right click down; refreshed by `RTMIN+14`. |
+| `cpu` | `CPU` | Package temperature, load since the last tick, mean core clock and fan `level:rpm`. Left click steps the fan floor up and wraps from max to auto, right click steps it down; the wheel steps up to max and down to auto, at most once per 300 ms, because one TrackPoint or touchpad gesture sends a burst of ticks. Clicks and the wheel reuse the last tick's readings. `cpu --test` runs 4 checks; refreshed by `RTMIN+14`. |
 | `volume` | `VOL` | Reads PipeWire through `pactl`; refreshed by `RTMIN+10`. |
 | `brightness` | `BRI` | Reads sysfs; `brightness-up` / `brightness-down` change it and signal `RTMIN+11`. |
 | `pogoda` | — | Thin wrapper over the forecast CLI in `agrocamping-recepcja`, which `weather` reads through. |
