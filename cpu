@@ -1,0 +1,59 @@
+#!/bin/sh
+# Blok CPU na pasku dwm (jak `gpu`): temperatura pakietu i obciążenie od poprzedniego wywołania
+# (delta /proc/stat — pierwsza klatka `top -bn1` pokazuje średnią od startu systemu, nie bieżącą),
+# do tego wiatrak: poziom EC i obroty z /proc/acpi/ibm/fan. LPM = poziom wyżej, po disengaged (max) wraca auto;
+# PPM = poziom niżej, do auto. Kółko jest ignorowane (tylko odświeża blok): jeden gest TrackPointa albo
+# touchpada to seria tików i poziom skakał losowo (11.09).
+# Buttons 1/3 write the manual request consumed by the separate wiatrak service.
+# That service defines how the request affects cooling; this helper does not implement
+# or verify its thermal-safety policy. EC zna tylko poziomy, nie RPM. Pułap widać jako
+# `~N` za obrotami (puste przy auto). Stała szerokość pól: status jest
+# kotwiczony do prawej i blok rosnący w lewo uciekałby spod kursora (przegląd 08.09).
+S=${XDG_RUNTIME_DIR:-/tmp}/cpu-block.stat
+LAST=${XDG_RUNTIME_DIR:-/tmp}/cpu-block.last
+MANUAL=$HOME/.local/state/wiatrak/manual
+LEVELS='auto 3 4 5 6 7 disengaged'
+if [ "${1:-}" = --test ]; then	# samotest w tymczasowym HOME: prawdziwy `manual` i stan paska zostają nietknięte
+	t=$(mktemp -d); trap 'rm -rf "$t"' EXIT; fail=0
+	m=$t/.local/state/wiatrak/manual; mkdir -p "${m%/*}"
+	run() { HOME=$t XDG_RUNTIME_DIR=$t BUTTON=$1 "$0"; }
+	ok() { if [ "$2" = "$3" ]; then echo "OK   $1"; else echo "FAIL $1: jest '$2', ma być '$3'"; fail=1; fi; }
+	for _ in 1 2 3; do run 1 > /dev/null; done
+	ok 'trzy LPM = trzy kroki w górę' "$(cat "$m")" 5
+	run 3 > /dev/null
+	ok 'PPM schodzi o poziom' "$(cat "$m")" 4
+	echo auto > "$m"; run 3 > /dev/null
+	ok 'PPM na auto stoi' "$(cat "$m")" auto
+	for b in 4 5; do run $b > /dev/null; done
+	ok 'kółko nie rusza poziomu' "$(cat "$m")" auto
+	echo disengaged > "$m"; run 1 > /dev/null
+	ok 'LPM po max wraca do auto' "$(cat "$m")" auto
+	printf '99°C 100%% 9.9GHz\n' > "$t/cpu-block.last"; out=$(run 2)
+	ok 'klik pokazuje pomiar z ostatniego tiku' "${out%%GHz*}GHz" '99°C 100% 9.9GHz'
+	exit $fail
+fi
+case ${BUTTON:-} in
+1|3)
+	m=$(head -1 "$MANUAL" 2>/dev/null); i=1; n=0
+	for l in $LEVELS; do n=$((n + 1)); [ "$l" = "$m" ] && i=$n; done
+	case $BUTTON in 1) i=$(( i % 7 + 1 )) ;; *) [ $i -gt 1 ] && i=$(( i - 1 )) ;; esac
+	set -- $LEVELS; shift $(( i - 1 )); echo "$1" > "$MANUAL.tmp" && mv "$MANUAL.tmp" "$MANUAL"
+	;;
+esac
+floor=$(head -1 "$MANUAL" 2>/dev/null); case $floor in auto|'') floor='' ;; disengaged) floor='~max' ;; *) floor="~$floor" ;; esac
+fan=$(awk -v f="$floor" '/^speed:/ {r=$2} /^level:/ {l=$2} END {sub("disengaged","max",l); if (r != "") printf " %4s:%4drpm %-4s", l, r, f}' /proc/acpi/ibm/fan 2>/dev/null)
+# klik nie mierzy od nowa: temperatura, obciążenie i takt są z ostatniego tiku, zmienia się tylko wiatrak
+[ -n "${BUTTON:-}" ] && IFS= read -r meas 2>/dev/null < "$LAST" && { printf '%s%s\n' "$meas" "$fan"; exit; }
+t=$(( $(cat "$(grep -l x86_pkg_temp /sys/class/thermal/thermal_zone*/type | sed 's/type$/temp/')") / 1000 ))
+read -r _ u n s i w q sq _ < /proc/stat
+idle=$((i + w)); total=$((u + n + s + i + w + q + sq)); util=0
+# okno krótsze niż ~0,25 s (klik zaraz po ticku) daje losowe 0/100 % i zmienia szerokość bloku: wtedy
+# poprzedni wynik zostaje i plik stanu się nie przesuwa
+if [ -r "$S" ] && read -r p_idle p_total p_util < "$S"; then
+	d=$((total - p_total))
+	if [ "$d" -ge 200 ]; then util=$(( 100 * (d - (idle - p_idle)) / d )); else util=${p_util:-0}; fi
+fi
+[ "${d:-200}" -ge 200 ] && echo "$idle $total $util" > "$S"
+ghz=$(awk '{s+=$1; n++} END {printf "%.1f", s/n/1e6}' /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq)
+meas=$(printf '%d°C %3d%% %sGHz' "$t" "$util" "$ghz"); echo "$meas" > "$LAST"
+printf '%s%s\n' "$meas" "$fan"
