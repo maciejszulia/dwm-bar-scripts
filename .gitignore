@@ -21,3 +21,7 @@
 !pogoda
 !volume
 !weather
+
+!.github/
+!.github/workflows/
+!.github/workflows/ci.yml
