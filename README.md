@@ -3,7 +3,7 @@
 [Polski](README.pl.md)
 
 Shell scripts used by the local
-[dwmblocks configuration](https://gitlab.com/maciejszulia/dwmblocks/-/blob/master/blocks.h).
+[dwmblocks configuration](https://github.com/maciejszulia/dwmblocks/blob/master/blocks.h).
 They read cached usage/forecast data or query desktop tools. Several controls
 also change desktop state; this is a workstation configuration, not a portable installer.
 
@@ -22,7 +22,7 @@ also change desktop state; this is a workstation configuration, not a portable i
 | `volume` | Reads volume; clicks change volume or mute through `BUTTON`. | `pactl`, a compatible audio server, GNU `grep -P`. |
 | `brightness` | Reads sysfs; wheel events change brightness. | A single matching backlight device; `brightnessctl` and write permission for changes. |
 | `brightness-up` / `brightness-down` | Changes brightness and signals `dwmblocks`. | `brightnessctl`, `pkill`. |
-| `pogoda` | Forwards arguments to `/home/ms/agrocamping-recepcja/scripts/pogoda.mjs`. | Node.js and the separate reception checkout; may fetch weather according to the arguments. |
+| `pogoda` | Forwards arguments to `~/agrocamping-recepcja/scripts/pogoda.mjs`. | Node.js and the separate reception checkout; may fetch weather according to the arguments. |
 
 `weather` defaults to `~/.local/state/agrocamping-recepcja/pogoda.json` and the
 adjacent `.jsonl` history. It does not call `pogoda` or fetch forecasts itself.
