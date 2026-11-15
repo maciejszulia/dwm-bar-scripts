@@ -1,9 +1,13 @@
 # dwm bar scripts
 
+[Polski](README.pl.md)
+
 Shell scripts used by the local
 [dwmblocks configuration](https://gitlab.com/maciejszulia/dwmblocks/-/blob/master/blocks.h).
 They read cached usage/forecast data or query desktop tools. Several controls
 also change desktop state; this is a workstation configuration, not a portable installer.
+
+![Four repositories make one desktop. Scripts feed dwmblocks, dwmblocks writes the status text, dwm draws it and sends each click back as a signal; st is the terminal.](desktop-stack.svg)
 
 ## Scripts and dependencies
 
@@ -62,4 +66,6 @@ selected files inside `~/.local/bin`. Add a new script to that allowlist before
 staging it, then check `git ls-files`. This prevents accidental additions, but
 is not a secret scanner. Do not commit usage logs, cache files or credentials.
 
-No licence file is included in this snapshot.
+## License
+
+MIT. See [LICENSE](LICENSE).

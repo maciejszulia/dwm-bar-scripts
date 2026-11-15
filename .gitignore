@@ -5,6 +5,10 @@
 *
 !.gitignore
 !README.md
+!README.pl.md
+!LICENSE
+!desktop-stack.svg
+!desktop-stack.pl.svg
 
 !brightness
 !brightness-down
