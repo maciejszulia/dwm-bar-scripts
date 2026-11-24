@@ -25,3 +25,9 @@
 !.github/
 !.github/workflows/
 !.github/workflows/ci.yml
+
+!docs/
+!docs/architecture/
+!docs/architecture/README.md
+!docs/architecture/adr/
+!docs/architecture/adr/*.md

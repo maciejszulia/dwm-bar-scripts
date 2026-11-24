@@ -69,3 +69,7 @@ is not a secret scanner. Do not commit usage logs, cache files or credentials.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Documentation
+
+- [Architecture (arc42, diagrams, ADRs)](docs/architecture/README.md)
