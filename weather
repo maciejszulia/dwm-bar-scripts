@@ -13,6 +13,8 @@ LOG=${WEATHER_LOG:-${CACHE%.json}.jsonl}
 FACTS=${WEATHER_FACTS:-$HOME/.cache/weather-facts}
 ENERGY=${WEATHER_ENERGY:-$HOME/.local/bin/energy}	# `energy facts` lines join the rotation
 ENERGY_DATA=$HOME/.local/state/energy/daily.json	# a fresh fetch rebuilds the facts
+WIDTH=${WEATHER_WIDTH:-31}	# every fact is padded to this many characters, so the blocks left of it stay put
+pad() { LC_ALL=C.UTF-8 awk -v w="$WIDTH" '{ printf "%-*s\n", w, $0 }'; }	# gawk counts characters, not bytes
 NOW=${WEATHER_NOW:-$(date +%s)}
 ALERT=$FACTS.alert
 ACK=$FACTS.ack
@@ -345,6 +347,7 @@ if [ -s "$ALERT" ]; then
 	ack=''
 	[ -f "$ACK" ] && read -r ack < "$ACK"
 	if [ "$id" != "$ack" ]; then
+		txt=$(printf '%s\n' "$txt" | pad)
 		# same width in both phases, so the bar does not jump while it blinks
 		if [ $(( NOW % 2 )) -eq 0 ]; then printf '\003%s\001\n' "$txt"; else printf '%s\n' "$txt"; fi
 		exit 0
@@ -354,4 +357,4 @@ fi
 spin_t0=0 spin_off=0
 [ -s "$SPIN" ] && read -r spin_t0 spin_off < "$SPIN"
 awk -v t="$(( spin_off + (NOW - spin_t0) / DWELL ))" \
-	'NR > 1 { a[++n] = $0 } END { if (n) print a[(t % n + n) % n + 1] }' "$FACTS"
+	'NR > 1 { a[++n] = $0 } END { if (n) print a[(t % n + n) % n + 1] }' "$FACTS" | pad

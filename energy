@@ -35,7 +35,8 @@ PORTAL = "https://mojlicznik.energa-operator.pl"
 # The portal answers anything that is not a known browser with an ErrorTabs page.
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
 LAT, LON = 53.7784, 20.4801  # Olsztyn, same point as the weather block
-SITES = ("dom", "kemping")
+SITES = ("all", "house", "camp")  # all = house + camp, the whole Energa meter
+LABEL = {"all": "RAZEM (dom + kemping)", "house": "DOM", "camp": "KEMPING"}
 
 # Gross PLN, VAT 23 % included.
 # Seller: Energa-Obrot "Cennik standardowy dla konsumentow" from 2026-02-01, group G12* (covers G12w).
@@ -343,8 +344,9 @@ def split(meter, camp):
         h1, h2 = max(0.0, e1 - c1), max(0.0, e2 - c2)
         ok = cplt and c is not None and c[2] >= 1410  # SUPLA covered at least 23.5 h
         tot = h1 + h2 + c1 + c2
-        sites["dom"][d] = [h1, h2, ok, (h1 + h2) / tot if tot else 1.0]
-        sites["kemping"][d] = [c1, c2, ok, (c1 + c2) / tot if tot else 0.0]
+        sites["all"][d] = [e1, e2, cplt, 1.0]
+        sites["house"][d] = [h1, h2, ok, (h1 + h2) / tot if tot else 1.0]
+        sites["camp"][d] = [c1, c2, ok, (c1 + c2) / tot if tot else 0.0]
     return sites
 
 
@@ -459,18 +461,19 @@ def facts(today=None, m=None, now=None):
     if not m.get("fetched_at"):
         return ["power: no data yet"]
     lines = []
-    for site, stamp in (("dom", m["fetched_at"]), ("kemping", m.get("camp_at"))):
+    camp_at = m.get("camp_at") or 0
+    for site, stamp in (("all", m["fetched_at"]), ("house", min(m["fetched_at"], camp_at)), ("camp", camp_at)):
         if not stamp or now - stamp > 6 * 3600:
             lines.append(f"{site}: stale since " + (datetime.fromtimestamp(stamp).strftime("%d.%m %H:%M") if stamp else "never"))
             continue
         s = m["sites"][site]
         p = s["periods"]
-        to = f" to {m['last_hour']}" if m.get("last_hour") else ""
-        lines.append(f"{site} today {num(p['today']['kwh'])} kWh {num(p['today']['zl'])} zł{to}")
-        lines += [f"{site} {k} {num(p[k]['kwh'])} kWh {num(p[k]['zl'])} zł" for k in ("week", "month", "year")]
+        to = f" @{m['last_hour']}" if m.get("last_hour") and site == "all" else ""
+        lines += [f"{site} {k} {num(p[k]['kwh'])}kWh {num(p[k]['zl'])}zł" + (to if k == "today" else "")
+                  for k in ("today", "week", "month", "year")]
         f = s.get("forecast")
         if f:
-            lines += [f"{site} next {n}d ~{num(f[f'{n}d']['kwh'])} kWh {num(f[f'{n}d']['zl'])} zł ±{f[f'{n}d']['band_zl']:.0f}"
+            lines += [f"{site} +{n}d ~{num(f[f'{n}d']['kwh'])}kWh {num(f[f'{n}d']['zl'])}zł ±{f[f'{n}d']['band_zl']:.0f}"
                       for n in (7, 30)]
             wd = week_deviation(s.get("deviation", []), today)
             if wd is not None:
@@ -500,7 +503,7 @@ def report():
     names = {"today": "dziś", "week": "ten tydzień", "month": "ten miesiąc", "year": "ten rok"}
     for site in SITES:
         s = m["sites"][site]
-        w(f"\n=== {site.upper()} ===")
+        w(f"\n=== {LABEL[site]} ===")
         for k, p in s["periods"].items():
             share = p["z2"] / p["kwh"] * 100 if p["kwh"] else 0
             w(f"  {names[k]:12} {p['kwh']:9.1f} kWh  ({share:.0f}% w strefie 2)  {p['zl']:9.2f} zł")
@@ -524,7 +527,7 @@ def report():
         wd = week_deviation(dev, today)
         if wd is not None:
             w(f"  Odchylenie ostatnich 7 dni: {wd:+.0f}%")
-    mm = sum(m["sites"][s]["periods"]["month"]["kwh"] for s in SITES)
+    mm = sum(m["sites"][s]["periods"]["month"]["kwh"] for s in ("house", "camp"))
     w(f"\nKontrola miesiąca: licznik Energa {m['meter_month']:.1f} kWh, dom + kemping {mm:.1f} kWh"
       + ("" if abs(mm - m["meter_month"]) < 0.05 else " (różnica: kemping większy od licznika w części dni)"))
     w("Do sprawdzenia na fakturze: liczba faz (przyjęte 3) i okres rozliczeniowy (przyjęty 1 m-c).")
@@ -572,8 +575,8 @@ def selftest():
           and gd[tue.isoformat()][2] == gd[wed.isoformat()][2] == 0)
     sp = split({tue: [10, 5, True]}, {tue: [3, 1, 1440]})
     check("house = meter - campsite, fixed shares add to 1",
-          sp["dom"][tue][:2] == [7, 4] and sp["kemping"][tue][:2] == [3, 1]
-          and abs(sp["dom"][tue][3] + sp["kemping"][tue][3] - 1) < 1e-9)
+          sp["house"][tue][:2] == [7, 4] and sp["camp"][tue][:2] == [3, 1] and sp["all"][tue][:2] == [10, 5]
+          and abs(sp["house"][tue][3] + sp["camp"][tue][3] - 1) < 1e-9)
 
     today = date(2026, 11, 25)  # a Wednesday
     usage = {"days": {}, "fetched_at": 1.0, "last_hour": "11:00", "tariff": "G12W"}
@@ -589,9 +592,9 @@ def selftest():
             camp["days"][d.isoformat()] = [4.0, 2.0, 1440]
     target = (today - timedelta(days=1)).isoformat()
     house = sum(usage["days"][target][:2]) - 6
-    fcs = {("dom", (today - timedelta(days=2)).isoformat()): {target: house / 1.1}}
+    fcs = {("house", (today - timedelta(days=2)).isoformat()): {target: house / 1.1}}
     m = compute(today, usage, camp, temps, fcs)
-    hm, cm = m["sites"]["dom"], m["sites"]["kemping"]
+    hm, cm = m["sites"]["house"], m["sites"]["camp"]
     check("week runs Monday to today", abs(cm["periods"]["week"]["kwh"] - 18) < 1e-9)
     check("month from the 1st", abs(cm["periods"]["month"]["kwh"] - 25 * 6) < 1e-9)
     check("house model fits the synthetic house", abs(hm["model"]["a"] - 20) < 1e-6 and abs(hm["model"]["b"] - 2.5) < 1e-6)
@@ -599,14 +602,14 @@ def selftest():
           abs(hm["forecast"]["days"][(today + timedelta(days=3)).isoformat()]
               - (20 + 2.5 * hdd(temps["t"][(today + timedelta(days=3)).isoformat()]))) < 1e-6)
     check("deviation +10%", abs(week_deviation(hm["deviation"], today) - 10) < 1e-6)
-    check("site costs add up to the meter", abs(sum(m["sites"][s]["periods"]["month"]["zl"] for s in SITES)
+    check("site costs add up to the meter", abs(sum(m["sites"][s]["periods"]["month"]["zl"] for s in ("house", "camp"))
           - sum(day_cost(*usage["days"][date(2026, 11, d).isoformat()][:2], date(2026, 11, d), m["year_kwh"])
                 for d in range(1, 26))) < 1e-6)
     lines = facts(today, m, now=2.0 + 7 * 3600)
-    check("stale facts after 6 h", lines[0].startswith("dom: stale") and lines[1].startswith("kemping: stale"))
+    check("stale facts after 6 h", [x.split(":")[0] for x in lines] == ["all", "house", "camp"])
     lines = facts(today, m, now=2.0)
-    check("today fact has kWh, zł and the hour",
-          any(x.startswith("dom today") and " kWh " in x and x.endswith("to 11:00") for x in lines))
+    check("today fact has kWh, zł and the hour", "all today" in lines[0] and lines[0].endswith("zł @11:00")
+          and lines[4].startswith("all +7d ~") and max(map(len, lines)) <= 31)
     sys.exit(0 if ok else 1)
 
 
