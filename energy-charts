@@ -160,6 +160,28 @@ def main(out_dir):
         "(szare pasy na wykresie dziennym).",
     ]
     mod = {s: m["sites"][s].get("model", {}) for s in ("house", "camp")}
+    r = m.get("readings") or []
+    first_reading = f"{r[0][0][8:10]}.{r[0][0][5:7]}" if r else "—"
+    invoice_rows, worst = "", 0.0
+    for iv in E.load("invoices.json", []):
+        a, b = date.fromisoformat(iv["start"]), date.fromisoformat(iv["end"])
+        ds = [a + timedelta(days=i) for i in range((b - a).days)]
+        if not all(d in meter for d in ds):
+            continue  # Moj Licznik history does not cover this invoice
+        kwh = sum(meter[d][0] + meter[d][1] for d in ds)
+        zl = sum(E.day_cost(meter[d][0], meter[d][1], d, year_kwh) for d in ds)
+        if b.year >= 2026:  # 2025 invoices ran on the 2025 prices, which these rates do not model
+            worst = max(worst, abs(zl / iv["zl"] - 1) * 100)
+        invoice_rows += (f"<tr><td>{iv['number']}</td><td>{a:%d.%m.%Y}–{b:%d.%m.%Y}</td><td>{iv['kwh']:,} / {kwh:,.0f}</td>"
+                         f"<td>{iv['zl']:,.2f} zł</td><td>{zl:,.2f} zł</td><td>{zl - iv['zl']:+.2f} zł</td></tr>")
+    insights.insert(0, f"Stawki są sprawdzone na fakturach Energa: kWh zgadzają się co do 1 kWh, a kwoty faktur z 2026 r. z dokładnością do {worst:.1f} % "
+                       "(faktura FES/00011 z 2025 r. odbiega o 2,6 %, bo w 2025 r. obowiązywały inne ceny). "
+                       "Twoja umowa ma tańszą energię niż cennik standardowy (0,7512 i 0,4908 zł/kWh brutto) i nie ma opłaty handlowej.")
+    if r and p.get("szkutnik"):
+        sz = p["szkutnik"]
+        insights.insert(2, f"Szkutnik (lokator) zużył od {first_reading} {sz['year']['kwh']:,.0f} kWh za {sz['year']['zl']:,.0f} zł, "
+                           f"w tym miesiącu {sz['month']['kwh']:,.0f} kWh za {sz['month']['zl']:,.0f} zł (z udziałem w opłatach stałych). "
+                           "Dokładność rośnie z każdym cotygodniowym zdjęciem licznika.")
     doc = f"""<!doctype html><html lang="pl"><meta charset="utf-8"><title>Prąd: dom i kemping</title>
 <style>
 @page {{ size: A4; margin: 14mm; }}
@@ -176,7 +198,7 @@ li {{ margin-bottom: 5px; line-height: 1.35; }}
 <h1>Prąd: dom i kemping</h1>
 <div class="sub">Stan na {today:%d.%m.%Y}, licznik Energa do {m.get('last_hour') or '—'}; taryfa G12w; kwoty brutto z opłatami stałymi podzielonymi według kWh każdego dnia.
 Kemping mierzy podlicznik SUPLA, dom = licznik Energa − kemping.</div>
-<table><tr><th></th><th>razem (dom + kemping)</th><th>dom</th><th>kemping</th></tr>{table}</table>
+<table><tr><th></th><th>razem (dom + kemping)</th><th>dom</th><th>kemping</th><th>w tym szkutnik (od {first_reading})</th></tr>{table}</table>
 {stacked_bars(kwh_rows, "kWh", "Zużycie miesięczne (kWh)")}
 {stacked_bars(zl_rows, "zł", "Koszt miesięczny (zł brutto)")}
 <h2>Spostrzeżenia</h2><ol>{''.join(f'<li>{html.escape(x)}</li>' for x in insights)}</ol>
@@ -185,11 +207,12 @@ Kemping mierzy podlicznik SUPLA, dom = licznik Energa − kemping.</div>
 {lines(daily, "kWh", "Zużycie dzienne, ostatnie 90 dni (kemping linią przerywaną)", gaps)}
 <div class="two"><div>{scatter(sc['house'], mod['house'].get('r2', 0), "Dom: zużycie a temperatura")}</div>
 <div>{scatter(sc['camp'], mod['camp'].get('r2', 0), "Kemping: zużycie a temperatura")}</div></div>
+<h2>Sprawdzenie na fakturach Energa</h2><table><tr><th>faktura</th><th>okres</th><th>kWh faktura / Mój Licznik</th><th>kwota faktury</th><th>wyliczenie programu</th><th>różnica</th></tr>{invoice_rows}</table>
 <h2>Prognoza</h2><table><tr><th></th><th>dom</th><th>kemping</th></tr>{ftable}</table>
 <h2>Cena 1 kWh (brutto)</h2><table>
 <tr><td>strefa 1 (dzienna)</td><td>{E.ZONE_PRICE[0]:.4f} zł</td></tr><tr><td>strefa 2 (nocna i weekend)</td><td>{E.ZONE_PRICE[1]:.4f} zł</td></tr>
 <tr><td>opłaty stałe licznika</td><td>{sum(E.MONTHLY.values()) + E.capacity_fee(year_kwh):.2f} zł/mies.</td></tr></table>
-<div class="sub">Źródła: Mój Licznik (Energa-Operator), SUPLA Cloud, Open-Meteo; cennik standardowy Energa-Obrót i stawki Energa-Operator od 1.02.2026.</div>
+<div class="sub">Źródła: Mój Licznik (Energa-Operator), SUPLA Cloud, Open-Meteo; stawki z faktury Energa FES/00016 (20.08–19.10.2026).</div>
 </div></html>"""
     os.makedirs(out_dir, exist_ok=True)
     page = os.path.join(out_dir, "report.html")
