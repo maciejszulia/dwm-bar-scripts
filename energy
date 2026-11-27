@@ -263,10 +263,10 @@ def fetch_camp(today, cutoff):
 
 # ---------- temperatures ----------
 
-def open_meteo(url):
+def open_meteo(url, raw=False):
     with urllib.request.urlopen(url, timeout=30) as r:
         d = json.load(r)["daily"]
-    return {t: v for t, v in zip(d["time"], d["temperature_2m_mean"]) if v is not None}
+    return d if raw else {t: v for t, v in zip(d["time"], d["temperature_2m_mean"]) if v is not None}
 
 
 def fetch_temps(today):
@@ -277,7 +277,12 @@ def fetch_temps(today):
         st["t"].update(open_meteo(f"https://archive-api.open-meteo.com/v1/archive?{q}"
                                   f"&start_date={start}&end_date={today - timedelta(days=6)}"))
         st["archive_at"] = time.time()
-    st["t"].update(open_meteo(f"https://api.open-meteo.com/v1/forecast?{q}&past_days=14&forecast_days=16"))
+    q3 = q.replace("daily=temperature_2m_mean", "daily=temperature_2m_mean,temperature_2m_min,temperature_2m_max,weather_code")
+    d = open_meteo(f"https://api.open-meteo.com/v1/forecast?{q3}&past_days=14&forecast_days=16", raw=True)
+    st["t"].update({k: v for k, v in zip(d["time"], d["temperature_2m_mean"]) if v is not None})
+    # the next 3 days for the `forecast3` block: [day, min, max, WMO weather code]
+    st["next3"] = [[k, lo, hi, c] for k, lo, hi, c in zip(d["time"], d["temperature_2m_min"], d["temperature_2m_max"], d["weather_code"])
+                   if k > today.isoformat()][:3]
     st["forecast_to"] = (today + timedelta(days=15)).isoformat()
     return st
 
@@ -500,7 +505,7 @@ def report():
     w("Opłaty stałe na miesiąc: " + ", ".join(f"{k} {v:.2f}" for k, v in MONTHLY.items())
       + f", mocowa {fee:.2f} (licznik, 365 dni: {m['year_kwh']:.0f} kWh) = {sum(MONTHLY.values()) + fee:.2f} zł;"
       " dzielone między dom i kemping według kWh każdego dnia")
-    names = {"today": "dziś", "week": "ten tydzień", "month": "ten miesiąc", "year": "ten rok"}
+    names = {"today": datetime.now().strftime("dziś – %d.%m.%Y, %H:%M"), "week": "ten tydzień", "month": "ten miesiąc", "year": "ten rok"}
     for site in SITES:
         s = m["sites"][site]
         w(f"\n=== {LABEL[site]} ===")

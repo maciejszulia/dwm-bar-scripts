@@ -13,7 +13,7 @@ import os
 import subprocess
 import sys
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 E = importlib.machinery.SourceFileLoader("energy", os.path.join(os.path.dirname(os.path.realpath(__file__)), "energy")).load_module()
 INK, MUTED, GRID = "#1a1a1a", "#555", "#d0d0d0"
@@ -132,7 +132,7 @@ def main(out_dir):
     fc = {s: m["sites"][s].get("forecast") for s in ("house", "camp")}
 
     p = {s: m["sites"][s]["periods"] for s in E.SITES}
-    names = {"today": "dziś", "week": "ten tydzień", "month": "ten miesiąc", "year": "ten rok"}
+    names = {"today": datetime.now().strftime("dziś – %d.%m.%Y, %H:%M"), "week": "ten tydzień", "month": "ten miesiąc", "year": "ten rok"}
     table = "".join(f"<tr><td>{names[k]}</td>" + "".join(f"<td>{p[s][k]['kwh']:,.1f} kWh<br><b>{p[s][k]['zl']:,.2f} zł</b></td>" for s in E.SITES) + "</tr>"
                     for k in names)
     ftable = "".join(f"<tr><td>następne {n} dni</td>" + "".join(

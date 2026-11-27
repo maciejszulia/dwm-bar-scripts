@@ -1,0 +1,13 @@
+#!/bin/sh
+# The next 3 days on the dwm bar, "28 -5 snow": day of month, daily minimum in degC, sky.
+# Data comes from `energy fetch` (Open-Meteo, hourly), so the block never reaches the network.
+# Colours are dwm schemes: 6 snow, 7 rain, 8 sun, 4 dim (cloud, fog), 3 red (storm).
+F=${FORECAST3_STATE:-$HOME/.local/state/energy/temps.json}
+[ -s "$F" ] || { echo '--'; exit 0; }
+jq -r '
+def sky: if . == 0 or . == 1 then ["sun", 8] elif . <= 3 then ["cloud", 4] elif . <= 48 then ["fog", 4]
+	elif . <= 67 or (. >= 80 and . <= 82) then ["rain", 7] elif . <= 77 or . == 85 or . == 86 then ["snow", 6]
+	else ["storm", 3] end;
+[.next3[]? | (.[3] | sky) as $s
+	| "\([$s[1]] | implode)\(.[0][8:10] | tonumber) \(.[1] | round) \($s[0])\u0001"] | join(" ") | if . == "" then "--" else . end
+' "$F" 2>/dev/null || echo '--'

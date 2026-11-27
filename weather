@@ -176,14 +176,14 @@ fresh() {
 case ${1:-} in
 --ack)
 	[ -s "$ALERT" ] && { IFS='	' read -r id _ < "$ALERT"; printf '%s\n' "$id" > "$ACK"; }
-	pkill -RTMIN+12 dwmblocks 2>/dev/null
+	pkill -RTMIN+15 dwmblocks 2>/dev/null
 	exit 0
 	;;
 --turn)	# scroll on the bar: freeze the fact on show, step by $2, restart the dwell clock
 	t0=0 off=0
 	[ -s "$SPIN" ] && read -r t0 off < "$SPIN"
 	printf '%s %s\n' "$NOW" "$(( off + (NOW - t0) / DWELL + $2 ))" > "$SPIN"
-	pkill -RTMIN+12 dwmblocks 2>/dev/null
+	pkill -RTMIN+15 dwmblocks 2>/dev/null
 	exit 0
 	;;
 --facts)
