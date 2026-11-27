@@ -35,8 +35,10 @@ PORTAL = "https://mojlicznik.energa-operator.pl"
 # The portal answers anything that is not a known browser with an ErrorTabs page.
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
 LAT, LON = 53.7784, 20.4801  # Olsztyn, same point as the weather block
-SITES = ("all", "house", "camp")  # all = house + camp, the whole Energa meter
-LABEL = {"all": "RAZEM (dom + kemping)", "house": "DOM", "camp": "KEMPING"}
+SITES = ("all", "house", "camp", "szkutnik")  # all = house + camp (Energa); szkutnik is a tenant inside camp
+LABEL = {"all": "RAZEM (dom + kemping)", "house": "DOM", "camp": "KEMPING (cały, z szkutnikiem)",
+         "szkutnik": "SZKUTNIK (lokator, licznik analogowy w kempingu)"}
+TENANT = "szkutnik.json"  # manual readings of the tenant's analog meter behind SUPLA: [[ISO minute, kWh], ...]
 
 # Gross PLN, VAT 23 % included.
 # Seller: Energa-Obrot "Cennik standardowy dla konsumentow" from 2026-02-01, group G12* (covers G12w).
@@ -339,7 +341,44 @@ def read_forecasts():
 
 # ---------- model ----------
 
-def split(meter, camp):
+def tenant_days(readings):
+    """Analog readings [[ISO minute, kWh], ...] -> {date: [kWh, whole day covered]}: every interval
+    between two readings spreads evenly over its hours."""
+    # ponytail: even spread; if szkutnik turns out to be SUPLA phase 1, use that phase hour by hour instead
+    out = {}
+    for (ta, a), (tb, b) in zip(readings, readings[1:]):
+        t0, t1 = datetime.fromisoformat(ta), datetime.fromisoformat(tb)
+        rate = (b - a) / (t1 - t0).total_seconds()
+        t = t0
+        while t < t1:
+            nxt = min(datetime.combine(t.date() + timedelta(days=1), datetime.min.time()), t1)
+            day = out.setdefault(t.date(), [0.0, True])
+            day[0] += rate * (nxt - t).total_seconds()
+            day[1] = day[1] and t.time() == datetime.min.time() and nxt.date() > t.date() if t == t0 or nxt == t1 else day[1]
+            t = nxt
+    return out
+
+
+def add_reading(args):
+    """energy reading KWH [YYYY-MM-DD HH:MM]: one photo of the tenant's analog meter."""
+    try:
+        kwh = float(args[0].replace(",", "."))
+        when = datetime.strptime(" ".join(args[1:3]), "%Y-%m-%d %H:%M") if len(args) >= 3 else datetime.now().replace(second=0, microsecond=0)
+    except (IndexError, ValueError):
+        sys.exit("usage: energy reading KWH [YYYY-MM-DD HH:MM]")
+    if not 0 <= kwh < 1e6:
+        sys.exit("energy: a meter reading is between 0 and 999999 kWh")
+    st = load(TENANT, {"readings": []})
+    r = sorted(st["readings"] + [[when.isoformat(timespec="minutes"), kwh]])
+    for (ta, a), (tb, b) in zip(r, r[1:]):
+        if b < a:  # the meter only counts up; a lower later reading is a typo
+            sys.exit(f"energy: {kwh} kWh at {when} breaks the order: {a} kWh at {ta} > {b} kWh at {tb}")
+    st["readings"] = r
+    save(TENANT, st)
+    print(f"szkutnik: {len(r)} reading(s), last {r[-1][1]} kWh at {r[-1][0]}")
+
+
+def split(meter, camp, tenant=None):
     """Meter days and campsite days -> {site: {day: [z1, z2, complete, share of fixed]}}.
     The house is the meter minus the campsite, per zone, never below zero."""
     sites = {s: {} for s in SITES}
@@ -352,6 +391,10 @@ def split(meter, camp):
         sites["all"][d] = [e1, e2, cplt, 1.0]
         sites["house"][d] = [h1, h2, ok, (h1 + h2) / tot if tot else 1.0]
         sites["camp"][d] = [c1, c2, ok, (c1 + c2) / tot if tot else 0.0]
+        t = (tenant or {}).get(d)
+        if t:  # the analog meter has no zones: it takes the campsite's zone mix of that day
+            s2 = c2 / (c1 + c2) if c1 + c2 else 0.5
+            sites["szkutnik"][d] = [t[0] * (1 - s2), t[0] * s2, ok and t[1], t[0] / tot if tot else 0.0]
     return sites
 
 
@@ -437,9 +480,10 @@ def compute(today, usage=None, camp=None, temps=None, forecasts=None):
     cdays = {date.fromisoformat(k): v for k, v in camp.get("days", {}).items()}
     t = {date.fromisoformat(k): v for k, v in temps.get("t", {}).items()}
     year_kwh = sum(v[0] + v[1] for d, v in meter.items() if today - timedelta(days=365) < d <= today)
-    sites = split(meter, cdays)
+    readings = load(TENANT, {"readings": []})["readings"]
+    sites = split(meter, cdays, tenant_days(readings))
     out = {"year_kwh": year_kwh, "last_hour": usage.get("last_hour"), "fetched_at": usage.get("fetched_at"),
-           "camp_at": camp.get("fetched_at"), "tariff": usage.get("tariff"), "meter_month":
+           "camp_at": camp.get("fetched_at"), "tariff": usage.get("tariff"), "readings": readings, "meter_month":
            sum(v[0] + v[1] for d, v in meter.items() if d >= today.replace(day=1) and d <= today), "sites": {}}
     for s in SITES:
         site_fc = {made: days for (site, made), days in forecasts.items() if site == s}
@@ -467,14 +511,21 @@ def facts(today=None, m=None, now=None):
         return ["power: no data yet"]
     lines = []
     camp_at = m.get("camp_at") or 0
-    for site, stamp in (("all", m["fetched_at"]), ("house", min(m["fetched_at"], camp_at)), ("camp", camp_at)):
+    if len(m.get("readings", [])) < 2:
+        lines.append(f"\004szkutnik\001 {len(m.get('readings', []))} reading(s), need 2")
+    for site, stamp in (("all", m["fetched_at"]), ("house", min(m["fetched_at"], camp_at)), ("camp", camp_at),
+                        ("szkutnik", camp_at if len(m.get("readings", [])) > 1 else None)):
+        if stamp is None:
+            continue
         if not stamp or now - stamp > 6 * 3600:
             lines.append(f"{site}: stale since " + (datetime.fromtimestamp(stamp).strftime("%d.%m %H:%M") if stamp else "never"))
             continue
         s = m["sites"][site]
         p = s["periods"]
         to = f" @{m['last_hour']}" if m.get("last_hour") and site == "all" else ""
-        lines += [f"\004{site}\001 {k} {num(p[k]['kwh'])}kWh {num(p[k]['zl'])}zł" + (to if k == "today" else "")
+        since = m["readings"][0][0][8:10] + "." + m["readings"][0][0][5:7] if site == "szkutnik" and m.get("readings") else None
+        name = lambda k: f"since {since}" if k == "year" and since and m["readings"][0][0][:4] == str(today.year) and m["readings"][0][5:10] != "01-01" else k
+        lines += [f"\004{site}\001 {name(k)} {num(p[k]['kwh'])}kWh {num(p[k]['zl'])}zł" + (to if k == "today" else "")
                   for k in ("today", "week", "month", "year")]
         f = s.get("forecast")
         if f:
@@ -509,6 +560,12 @@ def report():
     for site in SITES:
         s = m["sites"][site]
         w(f"\n=== {LABEL[site]} ===")
+        if site == "szkutnik":
+            r = m.get("readings", [])
+            w("  Odczyty: " + ", ".join(f"{x[0][8:10]}.{x[0][5:7]}.{x[0][:4]} {x[0][11:]} {x[1]:,.1f} kWh" for x in r))
+            if r:
+                w(f"  Dane od pierwszego odczytu ({r[0][0][8:10]}.{r[0][0][5:7]}.{r[0][0][:4]}); zużycie między odczytami rozłożone równo na godziny."
+                  + (" Model i prognoza są niewiarygodne poniżej 8 odczytów (odczyt co tydzień)." if len(r) < 8 else ""))
         for k, p in s["periods"].items():
             share = p["z2"] / p["kwh"] * 100 if p["kwh"] else 0
             w(f"  {names[k]:12} {p['kwh']:9.1f} kWh  ({share:.0f}% w strefie 2)  {p['zl']:9.2f} zł")
@@ -540,6 +597,8 @@ def report():
 
 def selftest():
     import tempfile
+    global STATE
+    STATE = tempfile.mkdtemp()  # the self-test never reads or writes the real state
     ok = True
 
     def check(label, cond):
@@ -610,11 +669,18 @@ def selftest():
     check("site costs add up to the meter", abs(sum(m["sites"][s]["periods"]["month"]["zl"] for s in ("house", "camp"))
           - sum(day_cost(*usage["days"][date(2026, 11, d).isoformat()][:2], date(2026, 11, d), m["year_kwh"])
                 for d in range(1, 26))) < 1e-6)
-    lines = facts(today, m, now=2.0 + 7 * 3600)
-    check("stale facts after 6 h", [x.split(":")[0] for x in lines] == ["all", "house", "camp"])
+    lines = [re.sub(r"[\x01-\x1f]", "", x) for x in facts(today, m, now=2.0 + 7 * 3600)]
+    check("stale facts after 6 h", [x.split(":")[0].split(" ")[0] for x in lines] == ["szkutnik", "all", "house", "camp"])
+    td = tenant_days([["2026-11-24T12:00", 100.0], ["2026-11-26T12:00", 148.0]])  # 48 kWh over 48 h
+    check("szkutnik: readings spread by hours, edge days partial",
+          abs(td[date(2026, 11, 24)][0] - 12) < 1e-9 and abs(td[date(2026, 11, 25)][0] - 24) < 1e-9
+          and td[date(2026, 11, 25)][1] and not td[date(2026, 11, 24)][1])
+    sp = split({date(2026, 11, 25): [10, 30, True]}, {date(2026, 11, 25): [5, 15, 1440]}, td)
+    check("szkutnik takes the campsite zone mix", sp["szkutnik"][date(2026, 11, 25)][:2] == [6.0, 18.0])
     lines = [re.sub(r"[\x01-\x1f]", "", x) for x in facts(today, m, now=2.0)]
-    check("today fact has kWh, zł and the hour", "all today" in lines[0] and lines[0].endswith("zł @11:00")
-          and lines[4].startswith("all +7d ~") and max(map(len, lines)) <= 31)
+    al = [x for x in lines if x.startswith("all ")]
+    check("today fact has kWh, zł and the hour", al[0].startswith("all today") and al[0].endswith("zł @11:00")
+          and al[4].startswith("all +7d ~") and max(map(len, lines)) <= 31)
     sys.exit(0 if ok else 1)
 
 
@@ -629,6 +695,8 @@ if __name__ == "__main__":
         print("\n".join(facts()))
     elif cmd == "report":
         report()
+    elif cmd == "reading":
+        add_reading(sys.argv[2:])
     elif cmd == "--test":
         selftest()
     else:
