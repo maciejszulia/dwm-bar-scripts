@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install jq and pkill used by weather
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq procps
+      - name: Offline test of weather on synthetic forecast files
+        # The runner is a fresh VM without a status bar, so pkill has nothing to signal.
+        # On a desktop, run the test inside unshare as README.md shows.
+        run: TZ=Europe/Warsaw ./weather --test
