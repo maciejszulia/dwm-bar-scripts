@@ -14,8 +14,11 @@
 !brightness-down
 !brightness-up
 !cc-usage
-!codex-usage
 !cpu
+!codex-usage
+!energy
+!energy-charts
+!forecast3
 !gpu
 !ping-artix
 !pogoda

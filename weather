@@ -11,6 +11,11 @@ LON=${WEATHER_LON:-20.4801}
 CACHE=${WEATHER_CACHE:-$HOME/.local/state/agrocamping-recepcja/pogoda.json}
 LOG=${WEATHER_LOG:-${CACHE%.json}.jsonl}
 FACTS=${WEATHER_FACTS:-$HOME/.cache/weather-facts}
+ENERGY=${WEATHER_ENERGY:-$HOME/.local/bin/energy}	# `energy facts` lines join the rotation
+ENERGY_DATA=$HOME/.local/state/energy/daily.json	# a fresh fetch rebuilds the facts
+WIDTH=${WEATHER_WIDTH:-31}	# every fact is padded to this many characters, so the blocks left of it stay put
+# gawk counts characters, not bytes; colour codes (bytes 1-31) take no room on the bar, so they do not count
+pad() { LC_ALL=C.UTF-8 awk -v w="$WIDTH" '{ v = $0; gsub(/[\001-\037]/, "", v); n = w - length(v); printf "%s%*s\n", $0, (n > 0 ? n : 0), "" }'; }
 NOW=${WEATHER_NOW:-$(date +%s)}
 ALERT=$FACTS.alert
 ACK=$FACTS.ack
@@ -140,6 +145,7 @@ rebuild() {
 			--argjson lat "$LAT" --argjson lon "$LON" "$FACTS_JQ" "$CACHE" 2>/dev/null
 	} > "$FACTS.tmp"
 	[ "$(wc -l < "$FACTS.tmp")" -gt 1 ] || echo 'weather: no data' >> "$FACTS.tmp"
+	"$ENERGY" facts >> "$FACTS.tmp" 2>/dev/null	# home power cost, rotates with the weather facts
 	mv "$FACTS.tmp" "$FACTS"
 
 	# 600 linii to ~12 zrzutow po 48 godzin, czyli ~3 h historii; gdyby logger wydluzyl
@@ -164,29 +170,30 @@ rebuild() {
 fresh() {
 	built=0
 	[ -s "$FACTS" ] && read -r built < "$FACTS"
-	[ "$CACHE" -nt "$FACTS" ] || [ $(( NOW - built )) -ge "$REBUILD" ] && rebuild
+	[ "$CACHE" -nt "$FACTS" ] || [ "$ENERGY_DATA" -nt "$FACTS" ] || [ $(( NOW - built )) -ge "$REBUILD" ] && rebuild
 	:
 }
 
 case ${1:-} in
 --ack)
 	[ -s "$ALERT" ] && { IFS='	' read -r id _ < "$ALERT"; printf '%s\n' "$id" > "$ACK"; }
-	pkill -RTMIN+12 dwmblocks 2>/dev/null
+	pkill -RTMIN+15 dwmblocks 2>/dev/null
 	exit 0
 	;;
 --turn)	# scroll on the bar: freeze the fact on show, step by $2, restart the dwell clock
 	t0=0 off=0
 	[ -s "$SPIN" ] && read -r t0 off < "$SPIN"
 	printf '%s %s\n' "$NOW" "$(( off + (NOW - t0) / DWELL + $2 ))" > "$SPIN"
-	pkill -RTMIN+12 dwmblocks 2>/dev/null
+	pkill -RTMIN+15 dwmblocks 2>/dev/null
 	exit 0
 	;;
 --facts)
 	fresh
-	sed 1d "$FACTS"
+	sed 1d "$FACTS" | tr -d '\001-\010'	# the notification shows plain text, not bar colour codes
 	exit 0
 	;;
 --test)
+	export WEATHER_ENERGY=true	# fixtures count facts; keep the live power lines out
 	T0=$(date -d 'today 12:00' +%s)	# fixed hour of day, so fixture offsets and labels are stable
 	t_dir=$(mktemp -d)
 	t_fail=0
@@ -341,6 +348,7 @@ if [ -s "$ALERT" ]; then
 	ack=''
 	[ -f "$ACK" ] && read -r ack < "$ACK"
 	if [ "$id" != "$ack" ]; then
+		txt=$(printf '%s\n' "$txt" | pad)
 		# same width in both phases, so the bar does not jump while it blinks
 		if [ $(( NOW % 2 )) -eq 0 ]; then printf '\003%s\001\n' "$txt"; else printf '%s\n' "$txt"; fi
 		exit 0
@@ -350,4 +358,4 @@ fi
 spin_t0=0 spin_off=0
 [ -s "$SPIN" ] && read -r spin_t0 spin_off < "$SPIN"
 awk -v t="$(( spin_off + (NOW - spin_t0) / DWELL ))" \
-	'NR > 1 { a[++n] = $0 } END { if (n) print a[(t % n + n) % n + 1] }' "$FACTS"
+	'NR > 1 { a[++n] = $0 } END { if (n) print a[(t % n + n) % n + 1] }' "$FACTS" | pad

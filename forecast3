@@ -1,0 +1,17 @@
+#!/bin/sh
+# The next 3 days on the dwm bar in 3-letter words: weekday as the date block spells it, sky, daily minimum:
+# "sob CLD -5°". Sky words: SUN, CLD (cloud), FOG, RAI (rain), SNO (snow), STR (storm).
+# Data comes from `energy fetch` (Open-Meteo, hourly), so the block never reaches the network.
+# The sky word wears the dwm scheme of the sky (6 snow, 7 rain, 8 sun, 4 cloud or fog, 3 storm); the temperature is
+# icy blue at 0 degC and below, yellow from 25 degC, plain white between.
+F=${FORECAST3_STATE:-$HOME/.local/state/energy/temps.json}
+[ -s "$F" ] || { echo '--'; exit 0; }
+jq -r '
+def sky: if . <= 1 then ["SUN", 8] elif . <= 3 then ["CLD", 4] elif . <= 48 then ["FOG", 4]
+	elif . <= 67 or (. >= 80 and . <= 82) then ["RAI", 7] elif . <= 77 or . == 85 or . == 86 then ["SNO", 6]
+	else ["STR", 3] end;
+def wd: ["nie", "pon", "wto", "śro", "czw", "pią", "sob"][.[0] | strptime("%Y-%m-%d") | mktime | strftime("%w") | tonumber];
+[.next3[]? | (.[3] | sky) as $s
+	| (.[1] | round) as $t | (if $t <= 0 then 6 elif $t >= 25 then 8 else 1 end) as $tc
+	| "\u0004\(wd)\u0001 \([$s[1]] | implode)\($s[0]) \([$tc] | implode)\($t)°\u0001"] | join("  ") | if . == "" then "--" else . end
+' "$F" 2>/dev/null || echo '--'

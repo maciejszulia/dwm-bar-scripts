@@ -42,6 +42,7 @@ case ${BUTTON:-} in
 esac
 floor=$(head -1 "$MANUAL" 2>/dev/null); case $floor in auto|'') floor='' ;; disengaged) floor='~max' ;; *) floor="~$floor" ;; esac
 fan=$(awk -v f="$floor" '/^speed:/ {r=$2} /^level:/ {l=$2} END {sub("disengaged","max",l); if (r != "") printf " %4s:%4drpm %-4s", l, r, f}' /proc/acpi/ibm/fan 2>/dev/null)
+fan=''	# ponytail: fan hidden on the bar (owner 2026-11-27, "na razie"); delete this line and set signal 17 in blocks.h to bring it back
 # klik nie mierzy od nowa: temperatura, obciążenie i takt są z ostatniego tiku, zmienia się tylko wiatrak
 [ -n "${BUTTON:-}" ] && IFS= read -r meas 2>/dev/null < "$LAST" && { printf '%s%s\n' "$meas" "$fan"; exit; }
 t=$(( $(cat "$(grep -l x86_pkg_temp /sys/class/thermal/thermal_zone*/type | sed 's/type$/temp/')") / 1000 ))

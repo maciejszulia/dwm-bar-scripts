@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+"""Power cost for the house and the campsite behind one Energa meter (G12w).
+Energa "Moj Licznik" measures both; a SUPLA meter measures the campsite, and the
+house is the difference. For each site: kWh and zl today, this week, this month,
+this year, a weather-driven forecast for the next 7 and 30 days, and how far each
+day strayed from the forecast made the day before. The weather block on the dwm
+bar rotates the `energy facts` lines with its own.
+
+  energy fetch    pull Energa, SUPLA and temperatures (run hourly by ~/.local/sv/energy)
+  energy report   full breakdown in the terminal, no network
+  energy facts    bar lines, no network
+  energy --test   offline self-check
+
+Login: ~/.config/energa/credentials (line 1 e-mail, line 2 password) and
+~/.config/supla/token (read-only personal token), both mode 600.
+"""
+import base64
+import calendar
+import http.cookiejar
+import json
+import math
+import os
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, timedelta
+
+HOME = os.path.expanduser("~")
+CREDENTIALS = os.path.join(HOME, ".config/energa/credentials")
+SUPLA_TOKEN = os.path.join(HOME, ".config/supla/token")
+STATE = os.environ.get("ENERGY_STATE", os.path.join(HOME, ".local/state/energy"))
+PORTAL = "https://mojlicznik.energa-operator.pl"
+# The portal answers anything that is not a known browser with an ErrorTabs page.
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+LAT, LON = 53.7784, 20.4801  # Olsztyn, same point as the weather block
+SITES = ("all", "house", "camp")  # all = house + camp, the whole Energa meter
+LABEL = {"all": "RAZEM (dom + kemping)", "house": "DOM", "camp": "KEMPING"}
+
+# Gross PLN, VAT 23 % included.
+# Seller: Energa-Obrot "Cennik standardowy dla konsumentow" from 2026-02-01, group G12* (covers G12w).
+# Distribution: Energa-Operator "Informacja o stawkach brutto uslug dystrybucji" from 2026-02-01, G12w.
+# ponytail: hand-copied rates; when Energa publishes a new price list, update these lines.
+ENERGY = (0.8764, 0.5685)        # zone 1 (day), zone 2 (night), zl/kWh
+NETWORK = (0.4941, 0.1047)       # variable network rate, zl/kWh
+PER_KWH = {"jakościowa": 0.0408, "OZE": 0.00898, "kogeneracyjna": 0.00369}  # zl/kWh, both zones
+MONTHLY = {"handlowa": 19.90, "abonamentowa (zdalny odczyt, okres 1 m-c)": 0.91,
+           "stała sieciowa (3 fazy)": 24.81}  # zl/month; 1 phase: 17.65
+ZONE_PRICE = tuple(e + n + sum(PER_KWH.values()) for e, n in zip(ENERGY, NETWORK))
+
+HDD_BASE = 15.5  # degC; heating degree day = max(0, base - mean temperature)
+FIXED_HOLIDAYS = {(1, 1), (1, 6), (5, 1), (5, 3), (8, 15), (11, 1), (11, 11), (12, 24), (12, 25), (12, 26)}
+
+
+def capacity_fee(year_kwh):
+    """Monthly capacity fee for households, by yearly usage of the whole meter."""
+    if year_kwh < 500:
+        return 5.28
+    if year_kwh <= 1200:
+        return 12.68
+    if year_kwh <= 2800:
+        return 21.13
+    return 29.58
+
+
+def fixed_per_day(d, year_kwh):
+    return (sum(MONTHLY.values()) + capacity_fee(year_kwh)) / calendar.monthrange(d.year, d.month)[1]
+
+
+def day_cost(z1, z2, d, year_kwh, share=1.0):
+    """Zone kWh at zone prices plus `share` of the day's fixed charges."""
+    return z1 * ZONE_PRICE[0] + z2 * ZONE_PRICE[1] + share * fixed_per_day(d, year_kwh)
+
+
+def free_day(d):
+    # ponytail: moving holidays (Easter Monday, Corpus Christi) count as working days here
+    return d.weekday() >= 5 or (d.month, d.day) in FIXED_HOLIDAYS
+
+
+def zone(dt):
+    """G12w zone of a moment: 2 on free days, 13-15 and 22-06 on working days, else 1."""
+    if free_day(dt.date()) or 13 <= dt.hour < 15 or dt.hour >= 22 or dt.hour < 6:
+        return 2
+    return 1
+
+
+def fit(xs, ys):
+    """Least squares y = a + b*x; returns a, b, residual sd, r2."""
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx if sxx else 0.0
+    a = my - b * mx
+    res = [y - a - b * x for x, y in zip(xs, ys)]
+    sse = sum(r * r for r in res)
+    syy = sum((y - my) ** 2 for y in ys)
+    return a, b, math.sqrt(sse / max(n - 2, 1)), (1 - sse / syy) if syy else 0.0
+
+
+def hdd(t):
+    return max(0.0, HDD_BASE - t)
+
+
+def load(name, default):
+    try:
+        with open(os.path.join(STATE, name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(name, obj):
+    os.makedirs(STATE, exist_ok=True)
+    path = os.path.join(STATE, name)
+    with open(path + ".tmp", "w") as f:
+        json.dump(obj, f)
+    os.replace(path + ".tmp", path)
+
+
+def secret_lines(path, n):
+    st = os.stat(path)
+    if st.st_mode & 0o077:
+        sys.exit(f"energy: {path} must be mode 600 (chmod 600 it)")
+    with open(path) as f:
+        lines = [x.strip() for x in f.read().splitlines()]
+    if len(lines) < n or not all(lines[:n]):
+        sys.exit(f"energy: {path} needs {n} non-empty line(s)")
+    return lines[:n]
+
+
+# ---------- Energa ----------
+
+def get(opener, url, data=None, headers=None):
+    req = urllib.request.Request(url, data, headers or {})
+    with opener.open(req, timeout=30) as r:
+        return r.geturl(), r.read().decode()
+
+
+def login():
+    user, password = secret_lines(CREDENTIALS, 2)
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    op.addheaders = [("User-Agent", UA)]
+    url, html = get(op, PORTAL + "/dp/UserLogin.do")
+    if "maintenance" in url:
+        sys.exit("energy: Moj Licznik is under maintenance")
+    tok = re.search(r'name="_antixsrf" value="([^"]*)"', html)
+    if not tok:
+        sys.exit("energy: login form changed (no _antixsrf)")
+    form = urllib.parse.urlencode({"j_username": user, "j_password": password, "selectedForm": "1",
+                                   "save": "save", "clientOS": "web", "_antixsrf": tok.group(1)}).encode()
+    url, page = get(op, PORTAL + "/dp/UserLogin.do", form, {"Referer": PORTAL + "/dp/UserLogin.do"})
+    if "niepoprawne" in page:
+        sys.exit("energy: login rejected (check the credentials file)")
+    m = re.search(r"id:\s*(\d+),[\s\S]{0,300}?tariffCode:\s*'([^']+)'", page)
+    if not m:
+        sys.exit(f"energy: no meter point after login ({url})")
+    return op, m.group(1), m.group(2)
+
+
+def chart(op, mp, kind, d):
+    ms = int(time.mktime(datetime(d.year, d.month, d.day).timetuple()) * 1000)
+    _, body = get(op, f"{PORTAL}/dp/resources/chart?mainChartDate={ms}&type={kind}&meterPoint={mp}&mo=A%2B")
+    j = json.loads(body)
+    if not j.get("success"):
+        raise RuntimeError(f"chart {kind} {d}: {j.get('error')}")
+    return j["response"]["mainChart"] or []
+
+
+def month_starts(first, last):
+    d = date(first.year, first.month, 1)
+    while d <= last:
+        yield d
+        d = date(d.year + d.month // 12, d.month % 12 + 1, 1)
+
+
+def fetch_usage(today):
+    op, mp, tariff = login()
+    st = load("daily.json", {"days": {}})
+    full = time.time() - st.get("full_at", 0) >= 86400
+    first = today - timedelta(days=400) if full else (today.replace(day=1) - timedelta(days=1))
+    for m in month_starts(first, today):
+        for p in chart(op, mp, "MONTH", m):
+            d = datetime.fromtimestamp(int(p["tm"]) / 1000).date()
+            z = p["zones"]
+            st["days"][d.isoformat()] = [z[0] or 0.0, z[1] or 0.0, bool(p.get("cplt"))]
+    hours = chart(op, mp, "DAY", today)
+    st["last_hour"] = (datetime.fromtimestamp(int(hours[-1]["tm"]) / 1000) + timedelta(hours=1)).strftime("%H:%M") if hours else None
+    st["tariff"] = tariff
+    st["fetched_at"] = time.time()
+    if full:
+        st["full_at"] = st["fetched_at"]
+    if tariff.upper() != "G12W":
+        print(f"energy: tariff is {tariff}, the rates in this script are for G12w", file=sys.stderr)
+    return st
+
+
+# ---------- SUPLA ----------
+
+def supla_get(api, token, path):
+    req = urllib.request.Request(f"{api}/api/v3/{path}", headers={"Authorization": "Bearer " + token,
+                                                                  "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)
+
+
+def camp_days(logs, cutoff):
+    """Logs (ascending, counters in 0.01 Wh) -> {day: [zone1 kWh, zone2 kWh, minutes covered]}.
+    Each phase counts forward plus reverse energy: the phase 1 current transformer is mounted
+    backwards (it "exports" 0.7 kWh an hour at night), and the campsite has no PV to export."""
+    # ponytail: fae+rae is wrong the day the campsite gets PV; then count fae only and fix the CT
+    keys = [f"phase{p}_{k}" for p in (1, 2, 3) for k in ("fae", "rae")]
+    out = {}
+    for a, b in zip(logs, logs[1:]):
+        ta, tb = int(a["date_timestamp"]), int(b["date_timestamp"])
+        if datetime.fromtimestamp(ta) >= cutoff:
+            break
+        # A negative step is a counter reset; a step above 20 kWh per hour on one phase is a zero or
+        # missing reading next to a real one (the whole counter, thousands of kWh). Both are dropped.
+        limit = 20e5 * max(tb - ta, 600) / 3600
+        kwh = sum(dv for k in keys if 0 <= (dv := (b.get(k) or 0) - (a.get(k) or 0)) <= limit) / 1e5
+        # An interval across an outage (the meter was offline for days in November 2026) spreads
+        # evenly over its 10-minute slots; only regular intervals count as covered minutes.
+        n = max(1, round((tb - ta) / 600))
+        for i in range(n):
+            mid = datetime.fromtimestamp(ta + (i + 0.5) * (tb - ta) / n)
+            if mid >= cutoff:
+                break
+            day = out.setdefault(mid.date().isoformat(), [0.0, 0.0, 0])
+            day[zone(mid) - 1] += kwh / n
+            if n == 1:
+                day[2] += (tb - ta) // 60
+    return out
+
+
+def fetch_camp(today, cutoff):
+    token = secret_lines(SUPLA_TOKEN, 1)[0]
+    part = token.split(".")[1]
+    api = base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)).decode().rstrip("/")
+    st = load("camp.json", {"days": {}})
+    if not st.get("channel"):
+        meters = [c["id"] for c in supla_get(api, token, "channels") if "ELECTRICITYMETER" in json.dumps(c.get("function"))]
+        if len(meters) != 1:
+            raise RuntimeError(f"expected 1 SUPLA electricity meter, found {meters}")
+        st["channel"] = meters[0]
+    full = time.time() - st.get("full_at", 0) >= 86400
+    since = datetime.combine(today - timedelta(days=400 if full else 2), datetime.min.time())
+    logs, offset = [], 0
+    while True:  # newest first, until the page reaches back past `since`
+        page = supla_get(api, token, f"channels/{st['channel']}/measurement-logs?limit=5000&offset={offset}&order=DESC")
+        logs += page
+        offset += len(page)
+        if len(page) < 5000 or int(page[-1]["date_timestamp"]) < since.timestamp():
+            break
+    logs.sort(key=lambda x: int(x["date_timestamp"]))
+    first = (since + timedelta(days=1)).date().isoformat()  # the day of `since` may start before the first log
+    st["days"].update({d: v for d, v in camp_days(logs, cutoff).items() if d >= first})
+    st["fetched_at"] = time.time()
+    if full:
+        st["full_at"] = st["fetched_at"]
+    return st
+
+
+# ---------- temperatures ----------
+
+def open_meteo(url, raw=False):
+    with urllib.request.urlopen(url, timeout=30) as r:
+        d = json.load(r)["daily"]
+    return d if raw else {t: v for t, v in zip(d["time"], d["temperature_2m_mean"]) if v is not None}
+
+
+def fetch_temps(today):
+    st = load("temps.json", {"t": {}})
+    q = f"latitude={LAT}&longitude={LON}&daily=temperature_2m_mean&timezone=Europe%2FWarsaw"
+    if time.time() - st.get("archive_at", 0) >= 86400:
+        start = date(today.year - 5, today.month, 1)
+        st["t"].update(open_meteo(f"https://archive-api.open-meteo.com/v1/archive?{q}"
+                                  f"&start_date={start}&end_date={today - timedelta(days=6)}"))
+        st["archive_at"] = time.time()
+    q3 = q.replace("daily=temperature_2m_mean", "daily=temperature_2m_mean,temperature_2m_min,temperature_2m_max,weather_code")
+    d = open_meteo(f"https://api.open-meteo.com/v1/forecast?{q3}&past_days=14&forecast_days=16", raw=True)
+    st["t"].update({k: v for k, v in zip(d["time"], d["temperature_2m_mean"]) if v is not None})
+    # the next 3 days for the `forecast3` block: [day, min, max, WMO weather code]
+    st["next3"] = [[k, lo, hi, c] for k, lo, hi, c in zip(d["time"], d["temperature_2m_min"], d["temperature_2m_max"], d["weather_code"])
+                   if k > today.isoformat()][:3]
+    st["forecast_to"] = (today + timedelta(days=15)).isoformat()
+    return st
+
+
+def fetch():
+    today = date.today()
+    usage = fetch_usage(today)
+    save("daily.json", usage)
+    cutoff = datetime.combine(today, datetime.min.time())
+    if usage.get("last_hour"):  # the house is Energa minus SUPLA, so SUPLA stops where Energa stops
+        h, mi = map(int, usage["last_hour"].split(":"))
+        cutoff += timedelta(hours=h, minutes=mi)
+    else:
+        cutoff = datetime.now()
+    for name, job in (("camp.json", lambda: fetch_camp(today, cutoff)), ("temps.json", lambda: fetch_temps(today))):
+        try:
+            save(name, job())
+        except (OSError, RuntimeError, ValueError, KeyError, IndexError) as e:
+            print(f"energy: {name} not refreshed: {e}", file=sys.stderr)
+    model = compute(today)
+    log = os.path.join(STATE, "forecasts.jsonl")
+    done = made_today(log, today)
+    with open(log, "a") as f:
+        for site in SITES:
+            fc = model["sites"][site].get("forecast")
+            if fc and site not in done:
+                f.write(json.dumps({"made": today.isoformat(), "site": site,
+                                    "days": {k: round(v, 3) for k, v in fc["days"].items()}}) + "\n")
+
+
+def made_today(log, today):
+    try:
+        with open(log) as f:
+            return {j.get("site") for j in map(json.loads, f.readlines()[-6:]) if j.get("made") == today.isoformat()}
+    except (OSError, ValueError):
+        return set()
+
+
+def read_forecasts():
+    res = {}
+    try:
+        with open(os.path.join(STATE, "forecasts.jsonl")) as f:
+            for line in f:
+                try:
+                    j = json.loads(line)
+                    if j.get("site"):  # lines from before the split cover the whole meter
+                        res[(j["site"], j["made"])] = j["days"]
+                except (ValueError, KeyError):
+                    continue  # a torn last line from an interrupted write
+    except OSError:
+        pass
+    return res
+
+
+# ---------- model ----------
+
+def split(meter, camp):
+    """Meter days and campsite days -> {site: {day: [z1, z2, complete, share of fixed]}}.
+    The house is the meter minus the campsite, per zone, never below zero."""
+    sites = {s: {} for s in SITES}
+    for d, (e1, e2, cplt) in meter.items():
+        c = camp.get(d)
+        c1, c2 = (c[0], c[1]) if c else (0.0, 0.0)
+        h1, h2 = max(0.0, e1 - c1), max(0.0, e2 - c2)
+        ok = cplt and c is not None and c[2] >= 1410  # SUPLA covered at least 23.5 h
+        tot = h1 + h2 + c1 + c2
+        sites["all"][d] = [e1, e2, cplt, 1.0]
+        sites["house"][d] = [h1, h2, ok, (h1 + h2) / tot if tot else 1.0]
+        sites["camp"][d] = [c1, c2, ok, (c1 + c2) / tot if tot else 0.0]
+    return sites
+
+
+def site_model(today, days, t, temps, year_kwh, forecasts):
+    """days: {date: [z1, z2, complete, fixed share]} for one site."""
+    out = {}
+    starts = {"today": today, "week": today - timedelta(days=today.weekday()),
+              "month": today.replace(day=1), "year": today.replace(month=1, day=1)}
+    out["periods"] = {}
+    for name, start in starts.items():
+        z1 = z2 = cost = 0.0
+        d = start
+        while d <= today:
+            v = days.get(d)
+            if v:
+                z1, z2 = z1 + v[0], z2 + v[1]
+                cost += day_cost(v[0], v[1], d, year_kwh, v[3])
+            d += timedelta(days=1)
+        out["periods"][name] = {"z1": z1, "z2": z2, "kwh": z1 + z2, "zl": cost}
+
+    hist = [(d, v) for d, v in days.items() if today - timedelta(days=365) <= d < today and v[2] and d in t]
+    if len(hist) < 30:
+        return out
+    a, b, sd, r2 = fit([hdd(t[d]) for d, _ in hist], [v[0] + v[1] for _, v in hist])
+    share2 = {}
+    for free in (True, False):
+        z = [(v[0], v[1]) for d, v in hist if free_day(d) == free]
+        tot = sum(x + y for x, y in z)
+        share2[free] = sum(y for _, y in z) / tot if tot else 0.5
+    fixed_share = sum(v[3] for _, v in hist) / len(hist)
+    out["model"] = {"a": a, "b": b, "sd": sd, "r2": r2, "n": len(hist), "share2": share2, "fixed_share": fixed_share}
+
+    def cost_for(d, kwh):
+        s = share2[free_day(d)]
+        return kwh * ((1 - s) * ZONE_PRICE[0] + s * ZONE_PRICE[1]) + fixed_share * fixed_per_day(d, year_kwh)
+
+    def climate(d):
+        # mean temperature of the same calendar days (+-3) in the archive years
+        vals = [v for k, v in t.items() if k < today - timedelta(days=300)
+                and abs((date(2001, k.month, min(k.day, 28)) - date(2001, d.month, min(d.day, 28))).days) <= 3]
+        return sum(vals) / len(vals) if vals else None
+
+    fc, src = {}, {}
+    for i in range(1, 31):
+        d = today + timedelta(days=i)
+        temp = t.get(d) if d.isoformat() <= temps.get("forecast_to", "") else None
+        src[d] = "prognoza" if temp is not None else "norma"
+        if temp is None:
+            temp = climate(d)
+        if temp is None:
+            return out
+        fc[d] = (temp, max(0.0, a + b * hdd(temp)))
+    out["forecast"] = {"days": {d.isoformat(): k for d, (_, k) in fc.items()},
+                       "temps": {d.isoformat(): tp for d, (tp, _) in fc.items()},
+                       "source": {d.isoformat(): s for d, s in src.items()}}
+    avg_price = (ZONE_PRICE[0] + ZONE_PRICE[1]) / 2
+    for n in (7, 30):
+        sel = [today + timedelta(days=i) for i in range(1, n + 1)]
+        # ponytail: independent residuals, so the band is too narrow when cold spells run for days;
+        # a block bootstrap of the residuals would size it honestly
+        band = 1.96 * sd * math.sqrt(n)
+        out["forecast"][f"{n}d"] = {"kwh": sum(fc[d][1] for d in sel), "zl": sum(cost_for(d, fc[d][1]) for d in sel),
+                                    "band_kwh": band, "band_zl": band * avg_price}
+
+    dev = []  # reality against the forecast made the day before
+    for d, v in sorted(days.items()):
+        if not (today - timedelta(days=30) <= d < today) or not v[2]:
+            continue
+        f = forecasts.get((d - timedelta(days=1)).isoformat(), {}).get(d.isoformat())
+        if f is not None:
+            dev.append({"day": d.isoformat(), "forecast": f, "actual": v[0] + v[1],
+                        "zl": day_cost(v[0], v[1], d, year_kwh, v[3]) - cost_for(d, f)})
+    out["deviation"] = dev
+    return out
+
+
+def compute(today, usage=None, camp=None, temps=None, forecasts=None):
+    usage = usage if usage is not None else load("daily.json", {"days": {}})
+    camp = camp if camp is not None else load("camp.json", {"days": {}})
+    temps = temps if temps is not None else load("temps.json", {"t": {}})
+    forecasts = forecasts if forecasts is not None else read_forecasts()
+    meter = {date.fromisoformat(k): v for k, v in usage.get("days", {}).items()}
+    cdays = {date.fromisoformat(k): v for k, v in camp.get("days", {}).items()}
+    t = {date.fromisoformat(k): v for k, v in temps.get("t", {}).items()}
+    year_kwh = sum(v[0] + v[1] for d, v in meter.items() if today - timedelta(days=365) < d <= today)
+    sites = split(meter, cdays)
+    out = {"year_kwh": year_kwh, "last_hour": usage.get("last_hour"), "fetched_at": usage.get("fetched_at"),
+           "camp_at": camp.get("fetched_at"), "tariff": usage.get("tariff"), "meter_month":
+           sum(v[0] + v[1] for d, v in meter.items() if d >= today.replace(day=1) and d <= today), "sites": {}}
+    for s in SITES:
+        site_fc = {made: days for (site, made), days in forecasts.items() if site == s}
+        out["sites"][s] = site_model(today, sites[s], t, temps, year_kwh, site_fc)
+    return out
+
+
+def week_deviation(dev, today):
+    recent = [x for x in dev if date.fromisoformat(x["day"]) >= today - timedelta(days=7)]
+    fsum = sum(x["forecast"] for x in recent)
+    return (sum(x["actual"] for x in recent) / fsum - 1) * 100 if recent and fsum else None
+
+
+# ---------- output ----------
+
+def num(x):
+    return f"{x:.2f}" if x < 10 else f"{x:.1f}" if x < 100 else f"{x:.0f}"
+
+
+def facts(today=None, m=None, now=None):
+    today = today or date.today()
+    m = m or compute(today)
+    now = now or time.time()
+    if not m.get("fetched_at"):
+        return ["power: no data yet"]
+    lines = []
+    camp_at = m.get("camp_at") or 0
+    for site, stamp in (("all", m["fetched_at"]), ("house", min(m["fetched_at"], camp_at)), ("camp", camp_at)):
+        if not stamp or now - stamp > 6 * 3600:
+            lines.append(f"{site}: stale since " + (datetime.fromtimestamp(stamp).strftime("%d.%m %H:%M") if stamp else "never"))
+            continue
+        s = m["sites"][site]
+        p = s["periods"]
+        to = f" @{m['last_hour']}" if m.get("last_hour") and site == "all" else ""
+        lines += [f"\004{site}\001 {k} {num(p[k]['kwh'])}kWh {num(p[k]['zl'])}zł" + (to if k == "today" else "")
+                  for k in ("today", "week", "month", "year")]
+        f = s.get("forecast")
+        if f:
+            lines += [f"\004{site}\001 +{n}d ~{num(f[f'{n}d']['kwh'])}kWh {num(f[f'{n}d']['zl'])}zł ±{f[f'{n}d']['band_zl']:.0f}"
+                      for n in (7, 30)]
+            wd = week_deviation(s.get("deviation", []), today)
+            if wd is not None:
+                lines.append(f"\004{site}\001 7d vs forecast {wd:+.0f}%")
+    return lines
+
+
+def report():
+    today = date.today()
+    m = compute(today)
+    if not m.get("fetched_at"):
+        sys.exit("energy: no data yet, run `energy fetch`")
+    w = print
+    w(f"Prąd: licznik Energa (dom + kemping), taryfa {m['tariff']}, dane z "
+      f"{datetime.fromtimestamp(m['fetched_at']):%d.%m.%Y %H:%M}" + (f", pomiar do {m['last_hour']}" if m.get("last_hour") else ""))
+    w(f"Kemping: podlicznik SUPLA, dane z {datetime.fromtimestamp(m['camp_at']):%d.%m.%Y %H:%M}" if m.get("camp_at")
+      else "Kemping: brak danych SUPLA, dom = cały licznik")
+    w("\nCena 1 kWh (brutto):")
+    for i, name in enumerate(("strefa 1 (dzienna)", "strefa 2 (nocna)")):
+        parts = f"energia {ENERGY[i]:.4f} + dystrybucja {NETWORK[i]:.4f} + " + \
+                " + ".join(f"{k} {v:.5f}".rstrip("0") for k, v in PER_KWH.items())
+        w(f"  {name}: {ZONE_PRICE[i]:.4f} zł  ({parts})")
+    fee = capacity_fee(m["year_kwh"])
+    w("Opłaty stałe na miesiąc: " + ", ".join(f"{k} {v:.2f}" for k, v in MONTHLY.items())
+      + f", mocowa {fee:.2f} (licznik, 365 dni: {m['year_kwh']:.0f} kWh) = {sum(MONTHLY.values()) + fee:.2f} zł;"
+      " dzielone między dom i kemping według kWh każdego dnia")
+    names = {"today": datetime.now().strftime("dziś – %d.%m.%Y, %H:%M"), "week": "ten tydzień", "month": "ten miesiąc", "year": "ten rok"}
+    for site in SITES:
+        s = m["sites"][site]
+        w(f"\n=== {LABEL[site]} ===")
+        for k, p in s["periods"].items():
+            share = p["z2"] / p["kwh"] * 100 if p["kwh"] else 0
+            w(f"  {names[k]:12} {p['kwh']:9.1f} kWh  ({share:.0f}% w strefie 2)  {p['zl']:9.2f} zł")
+        mod = s.get("model")
+        if not mod:
+            w("  Prognoza: za mało danych (potrzeba 30 pełnych dni z temperaturą).")
+            continue
+        w(f"  Model: kWh/dzień = {mod['a']:.1f} + {mod['b']:.2f} × stopniodni (baza {HDD_BASE}°C), "
+          f"R² {mod['r2']:.2f}, odchylenie reszt {mod['sd']:.1f} kWh, {mod['n']} dni")
+        f = s.get("forecast")
+        if f:
+            for n in (7, 30):
+                x = f[f"{n}d"]
+                w(f"  Prognoza {n} dni: {x['kwh']:.0f} kWh ±{x['band_kwh']:.0f}, {x['zl']:.0f} zł ±{x['band_zl']:.0f} (95 %)")
+        dev = s.get("deviation") or []
+        if not dev:
+            w("  Odchylenia: brak; porównanie pojawi się dzień po pierwszej zapisanej prognozie.")
+        for x in dev[-7:]:
+            w(f"  {x['day']}  prognoza {x['forecast']:6.1f}  rzecz. {x['actual']:6.1f} kWh  "
+              f"{(x['actual'] / x['forecast'] - 1) * 100 if x['forecast'] else 0:+5.0f}%  {x['zl']:+7.2f} zł")
+        wd = week_deviation(dev, today)
+        if wd is not None:
+            w(f"  Odchylenie ostatnich 7 dni: {wd:+.0f}%")
+    mm = sum(m["sites"][s]["periods"]["month"]["kwh"] for s in ("house", "camp"))
+    w(f"\nKontrola miesiąca: licznik Energa {m['meter_month']:.1f} kWh, dom + kemping {mm:.1f} kWh"
+      + ("" if abs(mm - m["meter_month"]) < 0.05 else " (różnica: kemping większy od licznika w części dni)"))
+    w("Do sprawdzenia na fakturze: liczba faz (przyjęte 3) i okres rozliczeniowy (przyjęty 1 m-c).")
+
+
+def selftest():
+    import tempfile
+    ok = True
+
+    def check(label, cond):
+        nonlocal ok
+        print(("OK   " if cond else "FAIL ") + label)
+        ok &= bool(cond)
+
+    check("capacity thresholds", [capacity_fee(x) for x in (499, 500, 1200, 1201, 2800, 2801)]
+          == [5.28, 12.68, 12.68, 21.13, 21.13, 29.58])
+    # 10 kWh day zone + 5 kWh night zone on a November day, yearly usage above 2800 kWh:
+    # 10*1.42397 + 5*0.72667 + (19.90+0.91+24.81+29.58)/30 = 20.38
+    check("day cost by hand", round(day_cost(10, 5, date(2026, 11, 25), 5000), 2) == 20.38)
+    a, b, sd, r2 = fit([0, 2, 5, 10, 14], [20 + 2.5 * x for x in (0, 2, 5, 10, 14)])
+    check("fit recovers a=20 b=2.5", abs(a - 20) < 1e-9 and abs(b - 2.5) < 1e-9 and sd < 1e-9)
+    tue, sat = date(2026, 11, 24), date(2026, 11, 28)
+    at = lambda d, h, mi=0: datetime(d.year, d.month, d.day, h, mi)
+    check("G12w zones", [zone(at(tue, 14)), zone(at(tue, 16)), zone(at(sat, 16)), zone(at(tue, 5, 59)),
+                         zone(at(tue, 6)), zone(at(tue, 22)), zone(at(date(2026, 11, 11), 10))] == [2, 1, 2, 2, 1, 2, 2])
+
+    # SUPLA: phase 1 counts backwards (rae), phase 3 forwards and reads 0 once at 09:40
+    base = int(at(tue, 9).timestamp())
+    logs = []
+    for i in range(7):  # 09:00 .. 10:00, every 10 min, 0.1 kWh per phase per step
+        logs.append({"date_timestamp": base + 600 * i, "phase1_fae": 0, "phase1_rae": 10000 * i,
+                     "phase2_fae": 0, "phase2_rae": None, "phase3_fae": 10**9 + 10000 * i if i != 4 else 0,
+                     "phase3_rae": 0})
+    cd = camp_days(logs, at(tue, 23))
+    # phase 1: 6 x 0.1; phase 3: 4 x 0.1, the drop to 0 and the jump back to 10 000 kWh are both dropped
+    check("camp: reversed phase counted, zero reading dropped",
+          abs(cd[tue.isoformat()][0] - 1.0) < 1e-9 and cd[tue.isoformat()][1] == 0)
+    check("camp: cutoff stops early", abs(camp_days(logs, at(tue, 9, 25))[tue.isoformat()][0] - 0.4) < 1e-9)
+    wed = tue + timedelta(days=1)
+    gap = [{"date_timestamp": int(at(tue, 23).timestamp()), "phase1_fae": 0},
+           {"date_timestamp": int(at(wed, 2).timestamp()), "phase1_fae": 300000}]  # 3 kWh over 3 h offline
+    gd = camp_days(gap, at(wed, 12))
+    check("camp: an outage spreads over its hours, not counted as covered",
+          abs(gd[tue.isoformat()][1] - 1) < 1e-9 and abs(gd[wed.isoformat()][1] - 2) < 1e-9
+          and gd[tue.isoformat()][2] == gd[wed.isoformat()][2] == 0)
+    sp = split({tue: [10, 5, True]}, {tue: [3, 1, 1440]})
+    check("house = meter - campsite, fixed shares add to 1",
+          sp["house"][tue][:2] == [7, 4] and sp["camp"][tue][:2] == [3, 1] and sp["all"][tue][:2] == [10, 5]
+          and abs(sp["house"][tue][3] + sp["camp"][tue][3] - 1) < 1e-9)
+
+    today = date(2026, 11, 25)  # a Wednesday
+    usage = {"days": {}, "fetched_at": 1.0, "last_hour": "11:00", "tariff": "G12W"}
+    camp = {"days": {}, "fetched_at": 1.0}
+    temps = {"t": {}, "forecast_to": (today + timedelta(days=15)).isoformat()}
+    for i in range(-400, 31):
+        d = today + timedelta(days=i)
+        temp = 5.0 + 10 * math.sin(i / 58)
+        temps["t"][d.isoformat()] = temp
+        if i <= 0:
+            k = 20 + 2.5 * hdd(temp)  # the house follows the weather, the campsite takes a flat 6 kWh
+            usage["days"][d.isoformat()] = [k * 0.4 + 4, k * 0.6 + 2, True]
+            camp["days"][d.isoformat()] = [4.0, 2.0, 1440]
+    target = (today - timedelta(days=1)).isoformat()
+    house = sum(usage["days"][target][:2]) - 6
+    fcs = {("house", (today - timedelta(days=2)).isoformat()): {target: house / 1.1}}
+    m = compute(today, usage, camp, temps, fcs)
+    hm, cm = m["sites"]["house"], m["sites"]["camp"]
+    check("week runs Monday to today", abs(cm["periods"]["week"]["kwh"] - 18) < 1e-9)
+    check("month from the 1st", abs(cm["periods"]["month"]["kwh"] - 25 * 6) < 1e-9)
+    check("house model fits the synthetic house", abs(hm["model"]["a"] - 20) < 1e-6 and abs(hm["model"]["b"] - 2.5) < 1e-6)
+    check("forecast follows the forecast temperature",
+          abs(hm["forecast"]["days"][(today + timedelta(days=3)).isoformat()]
+              - (20 + 2.5 * hdd(temps["t"][(today + timedelta(days=3)).isoformat()]))) < 1e-6)
+    check("deviation +10%", abs(week_deviation(hm["deviation"], today) - 10) < 1e-6)
+    check("site costs add up to the meter", abs(sum(m["sites"][s]["periods"]["month"]["zl"] for s in ("house", "camp"))
+          - sum(day_cost(*usage["days"][date(2026, 11, d).isoformat()][:2], date(2026, 11, d), m["year_kwh"])
+                for d in range(1, 26))) < 1e-6)
+    lines = facts(today, m, now=2.0 + 7 * 3600)
+    check("stale facts after 6 h", [x.split(":")[0] for x in lines] == ["all", "house", "camp"])
+    lines = [re.sub(r"[\x01-\x1f]", "", x) for x in facts(today, m, now=2.0)]
+    check("today fact has kWh, zł and the hour", "all today" in lines[0] and lines[0].endswith("zł @11:00")
+          and lines[4].startswith("all +7d ~") and max(map(len, lines)) <= 31)
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
+    if cmd == "fetch":
+        try:
+            fetch()
+        except (OSError, RuntimeError, ValueError, KeyError) as e:
+            sys.exit(f"energy: fetch failed, keeping old data: {e}")
+    elif cmd == "facts":
+        print("\n".join(facts()))
+    elif cmd == "report":
+        report()
+    elif cmd == "--test":
+        selftest()
+    else:
+        sys.exit(__doc__)

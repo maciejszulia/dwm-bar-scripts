@@ -17,12 +17,15 @@ also change desktop state; this is a workstation configuration, not a portable i
 | `ping-artix` | Prints a cached result and starts a background measurement, at most once per configured interval. | `ping`, `awk`; network access to `PING_HOST` (default `artixlinux.org`). |
 | `cc-usage` | Reads the last cached Claude limits, marking passed reset times with `?`. | `jq`, GNU `date`, `~/.claude/rate_limits.json`. |
 | `codex-usage` | Searches the 20 newest rollout files for the last matching primary-limit entry. | `jq`, GNU `find`/`date`, local Codex logs; supports the recorded payload shape, not every CLI version. |
-| `cpu` | Shows CPU temperature, utilisation deltas, frequency and available ThinkPad fan readings. Optional button actions write a fan-control request. | Linux `/proc/stat`, `x86_pkg_temp` thermal sysfs and CPU frequency sysfs; optional `/proc/acpi/ibm/fan`. |
+| `cpu` | Shows CPU temperature, utilisation deltas and frequency. The fan readings and the clicks that write a fan-control request are off for now (owner, 27.11.2026); one line in `cpu` and signal 17 in `blocks.h` bring them back. | Linux `/proc` and sysfs. |
 | `gpu` | Prints GPU temperature and utilisation. | NVIDIA driver and `nvidia-smi`. |
 | `volume` | Reads volume; clicks change volume or mute through `BUTTON`. | `pactl`, a compatible audio server, GNU `grep -P`. |
 | `brightness` | Reads sysfs; wheel events change brightness. | A single matching backlight device; `brightnessctl` and write permission for changes. |
 | `brightness-up` / `brightness-down` | Changes brightness and signals `dwmblocks`. | `brightnessctl`, `pkill`. |
 | `pogoda` | Forwards arguments to `~/agrocamping-recepcja/scripts/pogoda.mjs`. | Node.js and the separate reception checkout; may fetch weather according to the arguments. |
+| `energy` | Power for the house and the campsite behind one Energa meter (G12w): Energa "Mój Licznik" minus the SUPLA sub-meter. Facts `all`, `house` and `camp` with kWh and zł for today, week, month and year, a 7 and 30 day forecast and deviations join the weather rotation; `energy report` prints the breakdown; `energy --test` runs 16 checks. | Python 3 stdlib; `~/.config/energa/credentials` and `~/.config/supla/token` (mode 600); the `energy` runit service runs `energy fetch` hourly. |
+| `energy-charts` | Writes a printable A4 power report (`report.html`, `report.pdf`) with monthly, daily and temperature charts and findings, grayscale for a mono laser. | Python 3 stdlib, `chromium` for the PDF, state from `energy fetch`. |
+| `forecast3` | The next 3 days as weekday, weather icon and daily minimum, coloured by dwm schemes 6 snow, 7 rain, 8 sun; click signals in `blocks.h` start at 9. | `jq`, Nerd Font, `next3` from `energy fetch`. |
 
 `weather` defaults to `~/.local/state/agrocamping-recepcja/pogoda.json` and the
 adjacent `.jsonl` history. It does not call `pogoda` or fetch forecasts itself.

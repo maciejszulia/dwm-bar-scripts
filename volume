@@ -11,5 +11,5 @@ MUTE=$(pactl get-sink-mute @DEFAULT_SINK@ | grep -oP 'yes|no')
 if [ "$MUTE" = "yes" ]; then
     echo "MUTE"
 else
-    echo "$VOL"
+    printf '%4s\n' "$VOL"	# stała szerokość: VOL 100%→99% przesuwało lewą krawędź i chybiony tik kółka spadał na CPU (teraz wiatrak)
 fi
