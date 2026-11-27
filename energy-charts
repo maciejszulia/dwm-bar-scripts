@@ -104,6 +104,102 @@ def scatter(points, r2, title, W=350, H=250):
     return out + "</svg>"
 
 
+def pearson(xs, ys):
+    n = len(xs)
+    if n < 3:
+        return 0.0
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx, syy = sum((x - mx) ** 2 for x in xs), sum((y - my) ** 2 for y in ys)
+    return sxy / math.sqrt(sxx * syy) if sxx and syy else 0.0
+
+
+def pct(vals, q):
+    v = sorted(vals)
+    return v[min(len(v) - 1, int(q * len(v)))] if v else 0.0
+
+
+def analysis(today, sites, t, cdays, m, year_kwh, insights):
+    """Correlations, weekday profile, year over year, base load, free-day effect, tenant share, zone shift.
+    Every number comes from the state files; findings are appended to `insights`."""
+    days = [d for d, v in sites["house"].items() if v[2] and d in t and today - timedelta(days=365) <= d < today]
+    kwh = lambda s, d: sites[s][d][0] + sites[s][d][1]
+    cols = {"dom": [kwh("house", d) for d in days], "kemping": [kwh("camp", d) for d in days],
+            "razem": [kwh("all", d) for d in days], "temperatura": [t[d] for d in days],
+            "dzień wolny": [1.0 if E.free_day(d) else 0.0 for d in days]}
+    names = list(cols)
+    head = "".join(f"<th>{n}</th>" for n in names)
+    corr = "".join(f"<tr><td>{a}</td>" + "".join(
+        f"<td>{pearson(cols[a], cols[b]):+.2f}</td>" if a != b else "<td>—</td>" for b in names) + "</tr>" for a in names[:3])
+    r_hc = pearson(cols["dom"], cols["kemping"])
+    r_ct = pearson(cols["kemping"], cols["temperatura"])
+    r_ht = pearson(cols["dom"], cols["temperatura"])
+
+    wd = "pon wto śro czw pią sob nie".split()
+    prof = []
+    for i, name in enumerate(wd):
+        sel = [d for d in days if d.weekday() == i]
+        prof.append((name, sum(kwh("house", d) for d in sel) / max(len(sel), 1), sum(kwh("camp", d) for d in sel) / max(len(sel), 1)))
+    free = {f: [d for d in days if E.free_day(d) == f] for f in (True, False)}
+    eff = {s: (sum(kwh(s, d) for d in free[True]) / max(len(free[True]), 1),
+               sum(kwh(s, d) for d in free[False]) / max(len(free[False]), 1)) for s in ("house", "camp")}
+
+    price = {s: (m["sites"][s]["periods"]["year"]["zl"] / m["sites"][s]["periods"]["year"]["kwh"]
+                 if m["sites"][s]["periods"]["year"]["kwh"] else 0) for s in ("all", "house", "camp")}
+    base = {s: pct([kwh(s, d) for d in days], 0.05) for s in ("house", "camp")}
+
+    a0, a1 = today.replace(day=1), today
+    b0, b1 = a0.replace(year=a0.year - 1), a1.replace(year=a1.year - 1)
+    def span(s, x, y):
+        return sum(kwh(s, d) for d in sites[s] if x <= d <= y)
+    yoy = [(s, span(s, b0, b1), span(s, a0, a1)) for s in ("all", "house", "camp")]
+    yoy_rows = "".join(f"<tr><td>{n}</td><td>{x:,.0f} kWh</td><td>{y:,.0f} kWh</td><td>{(y / x - 1) * 100 if x else 0:+.0f} %</td></tr>"
+                       for (s, x, y), n in zip(yoy, ("razem", "dom", "kemping")))
+
+    z1_year = sum(sites["all"][d][0] for d in sites["all"] if today - timedelta(days=365) < d <= today)
+    shift = 0.10 * z1_year * (E.ZONE_PRICE[0] - E.ZONE_PRICE[1])
+
+    share_txt = ""
+    # SUPLA gaps are spread over their hours, so every day between the first and the last reading counts
+    td = {d: v for d, v in sites["szkutnik"].items() if d < today}
+    if td:
+        tk = sum(v[0] + v[1] for v in td.values())
+        ck = sum(kwh("camp", d) for d in td)
+        share_txt = (f"<p>Szkutnik w dobach między odczytami ({len(td)} dób): {tk:,.0f} kWh z {ck:,.0f} kWh kempingu, "
+                     f"czyli {tk / ck * 100 if ck else 0:.0f} %.</p>")
+        insights.append(f"Szkutnik zużywa {tk / ck * 100 if ck else 0:.0f} % prądu kempingu ({len(td)} dób między odczytami licznika).")
+
+    strongest = max(((a, b, pearson(cols[a], cols[b])) for i, a in enumerate(names) for b in names[i + 1:]),
+                    key=lambda x: abs(x[2]))
+    insights.append(f"Najsilniejsza zależność w danych dobowych z roku: {strongest[0]} i {strongest[1]}, r = {strongest[2]:+.2f}. "
+                    f"Temperatura: z domem r = {r_ht:+.2f}, z kempingiem r = {r_ct:+.2f}; dom z kempingiem r = {r_hc:+.2f}.")
+    insights.append(f"Pobór stały (5. percentyl doby): dom {base['house']:.1f} kWh, kemping {base['camp']:.1f} kWh na dobę, "
+                    f"czyli ok. {base['house'] * 365 * price['house']:,.0f} zł i {base['camp'] * 365 * price['camp']:,.0f} zł rocznie za samo czuwanie urządzeń.")
+    insights.append(f"Dni wolne: dom {eff['house'][0]:.1f} kWh wobec {eff['house'][1]:.1f} kWh w dni robocze "
+                    f"({(eff['house'][0] / eff['house'][1] - 1) * 100 if eff['house'][1] else 0:+.0f} %), kemping {eff['camp'][0]:.1f} wobec {eff['camp'][1]:.1f} kWh "
+                    f"({(eff['camp'][0] / eff['camp'][1] - 1) * 100 if eff['camp'][1] else 0:+.0f} %).")
+    insights.append(f"Przeniesienie 10 % zużycia ze strefy 1 do strefy 2 oszczędza ok. {shift:,.0f} zł rocznie "
+                    f"(strefa 1 w ostatnich 365 dniach: {z1_year:,.0f} kWh).")
+    x0, y0 = yoy[0][1], yoy[0][2]
+    insights.append(f"Od 1 do {today:%d.%m} licznik zużył {y0:,.0f} kWh wobec {x0:,.0f} kWh w tym samym okresie rok temu "
+                    f"({(y0 / x0 - 1) * 100 if x0 else 0:+.0f} %).")
+
+    return f"""<div style="break-before: page">
+<h2>Analizy i korelacje (doby z pełnymi danymi z ostatnich 365 dni: {len(days)})</h2>
+<table><tr><th>r Pearsona</th>{head}</tr>{corr}</table>
+<div class="sub">r od −1 do +1; |r| poniżej 0,3 oznacza słabą zależność liniową. Dzień wolny: sobota, niedziela, święto stałe.</div>
+{stacked_bars(prof, "kWh", "Średnie zużycie według dnia tygodnia (kWh na dobę)", H=230)}
+<h2>Rok do roku: od 1 do {today:%d.%m}</h2>
+<table><tr><th></th><th>{b0.year}</th><th>{a0.year}</th><th>zmiana</th></tr>{yoy_rows}</table>
+<h2>Pobór stały i efekt dni wolnych</h2>
+<table><tr><th></th><th>pobór stały (5. percentyl doby)</th><th>dzień wolny</th><th>dzień roboczy</th><th>średnia cena 1 kWh w tym roku</th></tr>
+<tr><td>dom</td><td>{base['house']:.1f} kWh</td><td>{eff['house'][0]:.1f} kWh</td><td>{eff['house'][1]:.1f} kWh</td><td>{price['house']:.3f} zł</td></tr>
+<tr><td>kemping</td><td>{base['camp']:.1f} kWh</td><td>{eff['camp'][0]:.1f} kWh</td><td>{eff['camp'][1]:.1f} kWh</td><td>{price['camp']:.3f} zł</td></tr></table>
+{share_txt}
+<p>Scenariusz: 10 % zużycia strefy 1 przeniesione do strefy 2 daje ok. {shift:,.0f} zł rocznie.</p>
+</div>"""
+
+
 def main(out_dir):
     today = date.today()
     usage, camp, temps = E.load("daily.json", {"days": {}}), E.load("camp.json", {"days": {}}), E.load("temps.json", {"t": {}})
@@ -111,7 +207,7 @@ def main(out_dir):
     cdays = {date.fromisoformat(k): v for k, v in camp["days"].items()}
     t = {date.fromisoformat(k): v for k, v in temps["t"].items()}
     m = E.compute(today)
-    sites = E.split(meter, cdays)
+    sites = E.split(meter, cdays, E.tenant_days(E.load(E.TENANT, {"readings": []})["readings"]))
     year_kwh = m["year_kwh"]
     first = min(cdays) if cdays else today
     months = defaultdict(lambda: {"house": [0, 0], "camp": [0, 0]})
@@ -148,8 +244,8 @@ def main(out_dir):
         f"i kosztował {p['camp']['year']['zl']:,.0f} zł; dom {p['house']['year']['zl']:,.0f} zł.",
         f"Kemping poza sezonem pobiera średnio {camp_base:.0f} kWh na dobę (ostatnie 30 dni, tylko pełne doby SUPLA), "
         f"czyli ok. {camp_base * 30 * ((1 - z2['camp'] / 100) * E.ZONE_PRICE[0] + z2['camp'] / 100 * E.ZONE_PRICE[1]):,.0f} zł miesięcznie (ceny z obu stref według udziału kempingu). Pobór idzie głównie fazą 1 i trwa także w nocy "
-        "(0,7–1,2 kWh na godzinę). Dużą część tego poboru robi całoroczny lokator (szkutnik, licznik analogowy za SUPLA): "
-        "od 24.10 do 27.11 zużył 573 kWh z 1014 kWh kempingu; faza 1 ma oprócz niego innych odbiorców.",
+        "(0,7–1,2 kWh na godzinę). Dużą część tego poboru robi całoroczny lokator (szkutnik, licznik analogowy za SUPLA); "
+        "jego udział w kempingu podaje strona „Analizy i korelacje”.",
         "Temperatura nie tłumaczy zużycia ani domu, ani kempingu (R² 0,00), więc prognoza to w praktyce średnia z roku; "
         "dokładniejsza byłaby prognoza z ostatnich 4 tygodni z podziałem na dni robocze i wolne.",
         f"Strefa 2 (tańsza o 0,70 zł/kWh) to {z2['house']:.0f} % zużycia domu i {z2['camp']:.0f} % zużycia kempingu; "
@@ -182,6 +278,7 @@ def main(out_dir):
         insights.insert(2, f"Szkutnik (lokator) zużył od {first_reading} {sz['year']['kwh']:,.0f} kWh za {sz['year']['zl']:,.0f} zł, "
                            f"w tym miesiącu {sz['month']['kwh']:,.0f} kWh za {sz['month']['zl']:,.0f} zł (z udziałem w opłatach stałych). "
                            "Dokładność rośnie z każdym cotygodniowym zdjęciem licznika.")
+    analysis_html = analysis(today, sites, t, cdays, m, year_kwh, insights)
     doc = f"""<!doctype html><html lang="pl"><meta charset="utf-8"><title>Prąd: dom i kemping</title>
 <style>
 @page {{ size: A4; margin: 14mm; }}
@@ -212,6 +309,7 @@ Kemping mierzy podlicznik SUPLA, dom = licznik Energa − kemping.</div>
 <h2>Cena 1 kWh (brutto)</h2><table>
 <tr><td>strefa 1 (dzienna)</td><td>{E.ZONE_PRICE[0]:.4f} zł</td></tr><tr><td>strefa 2 (nocna i weekend)</td><td>{E.ZONE_PRICE[1]:.4f} zł</td></tr>
 <tr><td>opłaty stałe licznika</td><td>{sum(E.MONTHLY.values()) + E.capacity_fee(year_kwh):.2f} zł/mies.</td></tr></table>
+{analysis_html}
 <div class="sub">Źródła: Mój Licznik (Energa-Operator), SUPLA Cloud, Open-Meteo; stawki z faktury Energa FES/00016 (20.08–19.10.2026).</div>
 </div></html>"""
     os.makedirs(out_dir, exist_ok=True)
