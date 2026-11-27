@@ -14,7 +14,8 @@ FACTS=${WEATHER_FACTS:-$HOME/.cache/weather-facts}
 ENERGY=${WEATHER_ENERGY:-$HOME/.local/bin/energy}	# `energy facts` lines join the rotation
 ENERGY_DATA=$HOME/.local/state/energy/daily.json	# a fresh fetch rebuilds the facts
 WIDTH=${WEATHER_WIDTH:-31}	# every fact is padded to this many characters, so the blocks left of it stay put
-pad() { LC_ALL=C.UTF-8 awk -v w="$WIDTH" '{ printf "%-*s\n", w, $0 }'; }	# gawk counts characters, not bytes
+# gawk counts characters, not bytes; colour codes (bytes 1-31) take no room on the bar, so they do not count
+pad() { LC_ALL=C.UTF-8 awk -v w="$WIDTH" '{ v = $0; gsub(/[\001-\037]/, "", v); n = w - length(v); printf "%s%*s\n", $0, (n > 0 ? n : 0), "" }'; }
 NOW=${WEATHER_NOW:-$(date +%s)}
 ALERT=$FACTS.alert
 ACK=$FACTS.ack
@@ -188,7 +189,7 @@ case ${1:-} in
 	;;
 --facts)
 	fresh
-	sed 1d "$FACTS"
+	sed 1d "$FACTS" | tr -d '\001-\010'	# the notification shows plain text, not bar colour codes
 	exit 0
 	;;
 --test)

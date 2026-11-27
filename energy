@@ -474,15 +474,15 @@ def facts(today=None, m=None, now=None):
         s = m["sites"][site]
         p = s["periods"]
         to = f" @{m['last_hour']}" if m.get("last_hour") and site == "all" else ""
-        lines += [f"{site} {k} {num(p[k]['kwh'])}kWh {num(p[k]['zl'])}zł" + (to if k == "today" else "")
+        lines += [f"\004{site}\001 {k} {num(p[k]['kwh'])}kWh {num(p[k]['zl'])}zł" + (to if k == "today" else "")
                   for k in ("today", "week", "month", "year")]
         f = s.get("forecast")
         if f:
-            lines += [f"{site} +{n}d ~{num(f[f'{n}d']['kwh'])}kWh {num(f[f'{n}d']['zl'])}zł ±{f[f'{n}d']['band_zl']:.0f}"
+            lines += [f"\004{site}\001 +{n}d ~{num(f[f'{n}d']['kwh'])}kWh {num(f[f'{n}d']['zl'])}zł ±{f[f'{n}d']['band_zl']:.0f}"
                       for n in (7, 30)]
             wd = week_deviation(s.get("deviation", []), today)
             if wd is not None:
-                lines.append(f"{site} 7d vs forecast {wd:+.0f}%")
+                lines.append(f"\004{site}\001 7d vs forecast {wd:+.0f}%")
     return lines
 
 
@@ -612,7 +612,7 @@ def selftest():
                 for d in range(1, 26))) < 1e-6)
     lines = facts(today, m, now=2.0 + 7 * 3600)
     check("stale facts after 6 h", [x.split(":")[0] for x in lines] == ["all", "house", "camp"])
-    lines = facts(today, m, now=2.0)
+    lines = [re.sub(r"[\x01-\x1f]", "", x) for x in facts(today, m, now=2.0)]
     check("today fact has kWh, zł and the hour", "all today" in lines[0] and lines[0].endswith("zł @11:00")
           and lines[4].startswith("all +7d ~") and max(map(len, lines)) <= 31)
     sys.exit(0 if ok else 1)
