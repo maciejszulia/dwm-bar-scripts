@@ -40,15 +40,14 @@ LABEL = {"all": "RAZEM (dom + kemping)", "house": "DOM", "camp": "KEMPING (cały
          "szkutnik": "SZKUTNIK (lokator, licznik analogowy w kempingu)"}
 TENANT = "szkutnik.json"  # manual readings of the tenant's analog meter behind SUPLA: [[ISO minute, kWh], ...]
 
-# Gross PLN, VAT 23 % included.
-# Seller: Energa-Obrot "Cennik standardowy dla konsumentow" from 2026-02-01, group G12* (covers G12w).
-# Distribution: Energa-Operator "Informacja o stawkach brutto uslug dystrybucji" from 2026-02-01, G12w.
-# ponytail: hand-copied rates; when Energa publishes a new price list, update these lines.
-ENERGY = (0.8764, 0.5685)        # zone 1 (day), zone 2 (night), zl/kWh
+# Gross PLN, VAT 23 % included, checked against invoice FES/00016 (20.08-19.10.2026): recomputed 1950.10 zl
+# against 1950.08 zl billed. The owner's contract prices energy below the standard price list and has no
+# trade fee. Distribution: Energa-Operator 2026 rates, G12w, 3 phases.
+# ponytail: hand-copied rates; when an invoice shows new prices, update these lines and rerun the check.
+ENERGY = (0.7512, 0.4908)        # zone 1 (day), zone 2 (night), zl/kWh: 0.6107 and 0.3990 net on the invoice
 NETWORK = (0.4941, 0.1047)       # variable network rate, zl/kWh
 PER_KWH = {"jakościowa": 0.0408, "OZE": 0.00898, "kogeneracyjna": 0.00369}  # zl/kWh, both zones
-MONTHLY = {"handlowa": 19.90, "abonamentowa (zdalny odczyt, okres 1 m-c)": 0.91,
-           "stała sieciowa (3 fazy)": 24.81}  # zl/month; 1 phase: 17.65
+MONTHLY = {"abonamentowa (zdalny odczyt, okres 2 m-ce)": 0.86, "stała sieciowa (3 fazy)": 24.81}  # zl/month
 ZONE_PRICE = tuple(e + n + sum(PER_KWH.values()) for e, n in zip(ENERGY, NETWORK))
 
 HDD_BASE = 15.5  # degC; heating degree day = max(0, base - mean temperature)
@@ -592,7 +591,7 @@ def report():
     mm = sum(m["sites"][s]["periods"]["month"]["kwh"] for s in ("house", "camp"))
     w(f"\nKontrola miesiąca: licznik Energa {m['meter_month']:.1f} kWh, dom + kemping {mm:.1f} kWh"
       + ("" if abs(mm - m["meter_month"]) < 0.05 else " (różnica: kemping większy od licznika w części dni)"))
-    w("Do sprawdzenia na fakturze: liczba faz (przyjęte 3) i okres rozliczeniowy (przyjęty 1 m-c).")
+    w("Stawki sprawdzone na fakturze FES/00016 (20.08–19.10.2026): wyliczenie 1950,10 zł, faktura 1950,08 zł.")
 
 
 def selftest():
@@ -609,8 +608,8 @@ def selftest():
     check("capacity thresholds", [capacity_fee(x) for x in (499, 500, 1200, 1201, 2800, 2801)]
           == [5.28, 12.68, 12.68, 21.13, 21.13, 29.58])
     # 10 kWh day zone + 5 kWh night zone on a November day, yearly usage above 2800 kWh:
-    # 10*1.42397 + 5*0.72667 + (19.90+0.91+24.81+29.58)/30 = 20.38
-    check("day cost by hand", round(day_cost(10, 5, date(2026, 11, 25), 5000), 2) == 20.38)
+    # 10*1.29877 + 5*0.64897 + (0.86+24.81+29.58)/30 = 18.07
+    check("day cost by hand", round(day_cost(10, 5, date(2026, 11, 25), 5000), 2) == 18.07)
     a, b, sd, r2 = fit([0, 2, 5, 10, 14], [20 + 2.5 * x for x in (0, 2, 5, 10, 14)])
     check("fit recovers a=20 b=2.5", abs(a - 20) < 1e-9 and abs(b - 2.5) < 1e-9 and sd < 1e-9)
     tue, sat = date(2026, 11, 24), date(2026, 11, 28)
@@ -693,6 +692,10 @@ if __name__ == "__main__":
             sys.exit(f"energy: fetch failed, keeping old data: {e}")
     elif cmd == "facts":
         print("\n".join(facts()))
+    elif cmd == "bar":  # the energy block on the dwm bar: one fact per 30 s, padded to 31 visible characters
+        lines = facts()
+        line = lines[int(time.time() // 30) % len(lines)]
+        print(line + " " * max(0, 31 - len(re.sub(r"[\x01-\x1f]", "", line))))
     elif cmd == "report":
         report()
     elif cmd == "reading":
