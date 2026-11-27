@@ -393,7 +393,8 @@ def split(meter, camp, tenant=None):
         t = (tenant or {}).get(d)
         if t:  # the analog meter has no zones: it takes the campsite's zone mix of that day
             s2 = c2 / (c1 + c2) if c1 + c2 else 0.5
-            sites["szkutnik"][d] = [t[0] * (1 - s2), t[0] * s2, ok and t[1], t[0] / tot if tot else 0.0]
+            k = min(t[0], c1 + c2)  # never above the campsite meter it hangs behind (readings run later than SUPLA)
+            sites["szkutnik"][d] = [k * (1 - s2), k * s2, ok and t[1], k / tot if tot else 0.0]
     return sites
 
 
@@ -674,8 +675,10 @@ def selftest():
     check("szkutnik: readings spread by hours, edge days partial",
           abs(td[date(2026, 11, 24)][0] - 12) < 1e-9 and abs(td[date(2026, 11, 25)][0] - 24) < 1e-9
           and td[date(2026, 11, 25)][1] and not td[date(2026, 11, 24)][1])
-    sp = split({date(2026, 11, 25): [10, 30, True]}, {date(2026, 11, 25): [5, 15, 1440]}, td)
+    sp = split({date(2026, 11, 25): [20, 40, True]}, {date(2026, 11, 25): [10, 30, 1440]}, td)
     check("szkutnik takes the campsite zone mix", sp["szkutnik"][date(2026, 11, 25)][:2] == [6.0, 18.0])
+    sp = split({date(2026, 11, 25): [10, 30, True]}, {date(2026, 11, 25): [5, 15, 1440]}, td)
+    check("szkutnik never above the campsite meter", sum(sp["szkutnik"][date(2026, 11, 25)][:2]) == 20)
     lines = [re.sub(r"[\x01-\x1f]", "", x) for x in facts(today, m, now=2.0)]
     al = [x for x in lines if x.startswith("all ")]
     check("today fact has kWh, zł and the hour", al[0].startswith("all today") and al[0].endswith("zł @11:00")
