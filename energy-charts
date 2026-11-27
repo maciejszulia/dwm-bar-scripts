@@ -148,7 +148,8 @@ def main(out_dir):
         f"i kosztował {p['camp']['year']['zl']:,.0f} zł; dom {p['house']['year']['zl']:,.0f} zł.",
         f"Kemping poza sezonem pobiera średnio {camp_base:.0f} kWh na dobę (ostatnie 30 dni, tylko pełne doby SUPLA), "
         f"czyli ok. {camp_base * 30 * ((1 - z2['camp'] / 100) * E.ZONE_PRICE[0] + z2['camp'] / 100 * E.ZONE_PRICE[1]):,.0f} zł miesięcznie (ceny z obu stref według udziału kempingu). Pobór idzie głównie fazą 1 i trwa także w nocy "
-        "(0,7–1,2 kWh na godzinę): warto sprawdzić, które urządzenie na fazie 1 kempingu pracuje bez przerwy.",
+        "(0,7–1,2 kWh na godzinę). Dużą część tego poboru robi całoroczny lokator (szkutnik, licznik analogowy za SUPLA): "
+        "od 24.10 do 27.11 zużył 573 kWh z 1014 kWh kempingu; faza 1 ma oprócz niego innych odbiorców.",
         "Temperatura nie tłumaczy zużycia ani domu, ani kempingu (R² 0,00), więc prognoza to w praktyce średnia z roku; "
         "dokładniejsza byłaby prognoza z ostatnich 4 tygodni z podziałem na dni robocze i wolne.",
         f"Strefa 2 (tańsza o 0,70 zł/kWh) to {z2['house']:.0f} % zużycia domu i {z2['camp']:.0f} % zużycia kempingu; "
