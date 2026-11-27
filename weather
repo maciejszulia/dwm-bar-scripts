@@ -11,6 +11,8 @@ LON=${WEATHER_LON:-20.4801}
 CACHE=${WEATHER_CACHE:-$HOME/.local/state/agrocamping-recepcja/pogoda.json}
 LOG=${WEATHER_LOG:-${CACHE%.json}.jsonl}
 FACTS=${WEATHER_FACTS:-$HOME/.cache/weather-facts}
+ENERGY=${WEATHER_ENERGY:-$HOME/.local/bin/energy}	# `energy facts` lines join the rotation
+ENERGY_DATA=$HOME/.local/state/energy/daily.json	# a fresh fetch rebuilds the facts
 NOW=${WEATHER_NOW:-$(date +%s)}
 ALERT=$FACTS.alert
 ACK=$FACTS.ack
@@ -140,6 +142,7 @@ rebuild() {
 			--argjson lat "$LAT" --argjson lon "$LON" "$FACTS_JQ" "$CACHE" 2>/dev/null
 	} > "$FACTS.tmp"
 	[ "$(wc -l < "$FACTS.tmp")" -gt 1 ] || echo 'weather: no data' >> "$FACTS.tmp"
+	"$ENERGY" facts >> "$FACTS.tmp" 2>/dev/null	# home power cost, rotates with the weather facts
 	mv "$FACTS.tmp" "$FACTS"
 
 	# 600 linii to ~12 zrzutow po 48 godzin, czyli ~3 h historii; gdyby logger wydluzyl
@@ -164,7 +167,7 @@ rebuild() {
 fresh() {
 	built=0
 	[ -s "$FACTS" ] && read -r built < "$FACTS"
-	[ "$CACHE" -nt "$FACTS" ] || [ $(( NOW - built )) -ge "$REBUILD" ] && rebuild
+	[ "$CACHE" -nt "$FACTS" ] || [ "$ENERGY_DATA" -nt "$FACTS" ] || [ $(( NOW - built )) -ge "$REBUILD" ] && rebuild
 	:
 }
 
@@ -187,6 +190,7 @@ case ${1:-} in
 	exit 0
 	;;
 --test)
+	export WEATHER_ENERGY=true	# fixtures count facts; keep the live power lines out
 	T0=$(date -d 'today 12:00' +%s)	# fixed hour of day, so fixture offsets and labels are stable
 	t_dir=$(mktemp -d)
 	t_fail=0

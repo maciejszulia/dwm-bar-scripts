@@ -15,6 +15,7 @@ The block chain behind the dwm status bar on the T470p. Blocks are wired in
 | `volume` | `VOL` | Reads PipeWire through `pactl`; refreshed by `RTMIN+10`. |
 | `brightness` | `BRI` | Reads sysfs; `brightness-up` / `brightness-down` change it and signal `RTMIN+11`. |
 | `pogoda` | — | Thin wrapper over the forecast CLI in `agrocamping-recepcja`, which `weather` reads through. |
+| `energy` | weather | Home power cost from Energa "Mój Licznik" (G12w): today, this week, this month, this year, a forecast for the next 7 and 30 days from temperature, and how far each day strayed from the forecast made the day before. Its `energy facts` lines join the weather rotation. `energy report` prints the price breakdown, the model and the deviations; `energy --test` runs 10 checks. Login sits in `~/.config/energa/credentials` (2 lines, mode 600); the `energy` runit service runs `energy fetch` once an hour. |
 
 Data the bar depends on comes from
 `~/.local/state/agrocamping-recepcja/pogoda.json`, refreshed every 15 minutes by
